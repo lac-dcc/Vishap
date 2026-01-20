@@ -1,4 +1,6 @@
-# Value-Domain Analysis for TOSA
+<p align="center">
+  <img alt="Project Banner" src="assets/images/Banner.png" width="90%" height="auto"/></br>
+</p>
 
 The goal of this project is to implement a **Value-Domain Analysis** pass for tensor compilers using the MLIR TOSA dialect. This analysis maps tensor slices—subsets of a tensor with one fewer dimension—to their specific min-max ranges.
 
