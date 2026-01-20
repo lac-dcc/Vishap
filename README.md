@@ -37,7 +37,7 @@ You can run the value profiler on any TOSA-based MLIR file. For example, to anal
 
 ### Example Output
 
-The tool analyzes slices along the first dimension. For a hypothetical ``3 * 2 * 2` tensor:
+The tool analyzes slices along the first dimension. For a hypothetical `3 * 2 * 2` tensor:
 
 *  **Slice 0:** Min=0.0, Max=2.0 (Contains values like 1 and 2) 
 *  **Slice 1:** Min=0.0, Max=0.0 (Zero-slice) 
