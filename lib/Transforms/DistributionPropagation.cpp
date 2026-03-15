@@ -1,7 +1,9 @@
-// TODO: How do we do this in xnnc???
-// TODO: What should be in CMakeLists.txt?
 #include "Analysis/DistributionAnalysis.h"
 #include "Transforms/Passes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Debug.h"
 
 namespace mlir::vishap {
 #define GEN_PASS_DEF_DISTRIBUTIONPROPAGATIONPASS
@@ -16,10 +18,27 @@ public:
 
   void runOnOperation() override {
     auto func = getOperation();
-    DistributionAnalysis analysis;
 
+    DistributionAnalysis analysis;
     if (failed(analysis.run(func))) {
       signalPassFailure();
+    }
+
+    auto ctx = &getContext();
+    Builder builder(ctx);
+    // Traverse analyzed operations and annotate with distribution attribute
+    for (auto *op : analysis.getAnalyzedOperations()) {
+      llvm::SmallVector<Attribute, 3> distributions;
+      for (auto result : op->getResults()) {
+        if (auto dist = analysis.getDistribution(result)) {
+          auto distArray = distributionToArrayAttr(builder, *dist);
+          distributions.push_back(ArrayAttr::get(ctx, distArray));
+        } else {
+          distributions.push_back(UnitAttr::get(ctx));
+        }
+      }
+
+      op->setAttr(kDistributionAttrName, ArrayAttr::get(ctx, distributions));
     }
   }
 };

@@ -7,12 +7,10 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/LogicalResult.h"
 
-using namespace mlir;
-using namespace vishap;
-
+namespace mlir::vishap {
+namespace {
 #define DEBUG_TYPE "vishap-analysis"
 
-namespace {
 template <typename T>
 Distribution computeDistribution(DenseElementsAttr denseAttr) {
   double max = std::numeric_limits<double>::min();
@@ -22,11 +20,14 @@ Distribution computeDistribution(DenseElementsAttr denseAttr) {
   for (auto element : values) {
     max = max > element ? max : static_cast<double>(element);
     min = min < element ? min : static_cast<double>(element);
+    // FIXME: this could overflow for large values
     sum += element;
   }
 
   double mean = sum / values.size();
   double variance = 0.0;
+  // FIXME: should we traverse the whole constant, or only take a sample?
+  // For large constants, this could be expensive.
   for (auto element : values) {
     double elementDouble = static_cast<double>(element);
     variance += (elementDouble - mean) * (elementDouble - mean);
@@ -40,6 +41,14 @@ Distribution computeDistribution(DenseElementsAttr denseAttr) {
   return {min, max, mean, variance};
 }
 } // namespace
+
+std::array<Attribute, 4>
+distributionToArrayAttr(Builder &builder, const Distribution &distribution) {
+  return {builder.getF64FloatAttr(distribution.min),
+          builder.getF64FloatAttr(distribution.max),
+          builder.getF64FloatAttr(distribution.mean),
+          builder.getF64FloatAttr(distribution.variance)};
+}
 
 LogicalResult DistributionAnalysis::visitConstantOp(arith::ConstantOp constOp) {
   auto type = constOp.getType();
@@ -72,6 +81,7 @@ LogicalResult DistributionAnalysis::visitConstantOp(arith::ConstantOp constOp) {
     }
   }
 
+  this->analyzedOperations.insert(constOp.getOperation());
   return success();
 }
 
@@ -80,6 +90,8 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       .Case<arith::ConstantOp>(
           [&](arith::ConstantOp constOp) { return visitConstantOp(constOp); })
       .Default([&](Operation *) {
+        // FIXME: the default behavior should be for unsupported ops to act as
+        // identities.
         LLVM_DEBUG(llvm::dbgs()
                    << "Unsupported operation: " << op->getName() << "\n");
         return success();
@@ -97,3 +109,4 @@ LogicalResult DistributionAnalysis::run(func::FuncOp func) {
 
   return success();
 }
+} // namespace mlir::vishap
