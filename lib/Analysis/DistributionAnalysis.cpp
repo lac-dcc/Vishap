@@ -1,11 +1,6 @@
 #include "Analysis/DistributionAnalysis.h"
-#include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/IR/BuiltinAttributes.h"
-#include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/TypeSwitch.h"
-#include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/LogicalResult.h"
 
 namespace mlir::vishap {
 namespace {

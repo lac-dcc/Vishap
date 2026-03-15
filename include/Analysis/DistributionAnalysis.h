@@ -4,12 +4,9 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Value.h"
-#include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/StringRef.h"
-#include "llvm/IR/DerivedTypes.h"
-#include <optional>
+#include <array>
 
 namespace mlir::vishap {
 

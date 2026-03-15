@@ -1,9 +1,6 @@
 #include "Analysis/DistributionAnalysis.h"
 #include "Transforms/Passes.h"
-#include "mlir/IR/Builders.h"
-#include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/Support/Debug.h"
 
 namespace mlir::vishap {
 #define GEN_PASS_DEF_DISTRIBUTIONPROPAGATIONPASS
