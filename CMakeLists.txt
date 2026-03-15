@@ -27,6 +27,7 @@ include(AddMLIR)
 
 include_directories(
   ${PROJECT_SOURCE_DIR}/include
+  ${CMAKE_BINARY_DIR}/include
   ${LLVM_INCLUDE_DIRS}
   ${MLIR_INCLUDE_DIRS}
 )
@@ -43,3 +44,4 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 add_subdirectory(lib)
 add_subdirectory(tools)
+add_subdirectory(include)
