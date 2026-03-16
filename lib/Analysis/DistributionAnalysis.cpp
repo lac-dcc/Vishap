@@ -80,10 +80,43 @@ LogicalResult DistributionAnalysis::visitConstantOp(arith::ConstantOp constOp) {
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitAddOp(linalg::AddOp addOp) {
+  auto inputs = addOp.getInputs();
+  assert(inputs.size() == 2 && "Expected linalg.add to have exactly 2 inputs");
+
+  const Distribution *dist1 = getDistribution(inputs[0]);
+  const Distribution *dist2 = getDistribution(inputs[1]);
+  if (!dist1 || !dist2) {
+    // If we don't have distribution info for one of the inputs, we can't
+    // compute the distribution for the output.
+    return addOp.emitWarning()
+           << "Missing distribution info for one of the inputs, skipping "
+              "distribution analysis for this operation";
+  }
+
+  Distribution outputDist;
+  outputDist.min = dist1->min + dist2->min;
+  outputDist.max = dist1->max + dist2->max;
+  // Premise: inputs are independent and are described by a normal distribution
+  outputDist.mean = dist1->mean + dist2->mean;
+  outputDist.variance = dist1->variance + dist2->variance;
+
+  // Sanity check
+  assert(addOp->getNumResults() == 1 &&
+         "Expected linalg.add to have exactly one result");
+
+  distributionMap[addOp.getResult(0)] = outputDist;
+  this->analyzedOperations.insert(addOp.getOperation());
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
       .Case<arith::ConstantOp>(
           [&](arith::ConstantOp constOp) { return visitConstantOp(constOp); })
+      .Case<linalg::AddOp>(
+          [&](linalg::AddOp addOp) { return visitAddOp(addOp); })
       .Default([&](Operation *) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities.
