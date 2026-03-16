@@ -1,0 +1,6 @@
+.venv
+.vscode
+.cache
+build/
+tmp/
+/models/

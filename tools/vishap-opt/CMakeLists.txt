@@ -1,24 +1,20 @@
-add_executable(vishap-opt
+add_llvm_executable(vishap-opt
   vishap-opt.cpp
 )
 
-# RTTI handling (match LLVM build)
-if(NOT LLVM_ENABLE_RTTI)
-  target_compile_options(vishap-opt PRIVATE -fno-rtti)
-endif()
+llvm_update_compile_flags(vishap-opt)
+
+get_property(dialect_libs GLOBAL PROPERTY MLIR_DIALECT_LIBS)
+get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
 
 target_link_libraries(vishap-opt
   PRIVATE
-    VishapPasses
-    MLIRTosaDialect
-    MLIRFuncDialect
-    MLIRParser
-    MLIRPass
-    MLIRIR
-    MLIRSupport
-    LLVMSupport
+  VishapTransforms
+
+  # MLIR dependencies
+  MLIROptLib
+  ${dialect_libs}
+  ${conversion_libs}
 )
 
-set_target_properties(vishap-opt PROPERTIES
-  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-)
+mlir_check_link_libraries(mlir-opt)

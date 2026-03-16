@@ -8,31 +8,35 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # MLIR / LLVM configuration
 # ------------------------------------------------------------------------------
 
-# IMPORTANT: disable LSP *before* find_package(MLIR)
-set(MLIR_ENABLE_LSP OFF CACHE BOOL "Disable MLIR LSP support" FORCE)
-
-find_package(LLVM REQUIRED CONFIG
-  PATHS /home/fernando/Program/llvm-project/build/lib/cmake/llvm
-)
+find_package(LLVM REQUIRED CONFIG)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
-find_package(MLIR REQUIRED CONFIG
-  PATHS /home/fernando/Program/llvm-project/build/lib/cmake/mlir
-)
+find_package(MLIR REQUIRED CONFIG)
 message(STATUS "Using MLIRConfig.cmake in: ${MLIR_DIR}")
+
+list(APPEND CMAKE_MODULE_PATH "${MLIR_CMAKE_DIR}")
+list(APPEND CMAKE_MODULE_PATH "${MLIR_LLVM_DIR}")
 
 # ------------------------------------------------------------------------------
 # Includes / definitions
 # ------------------------------------------------------------------------------
 
+include(AddLLVM)
+include(AddMLIR)
+
 include_directories(
   ${PROJECT_SOURCE_DIR}/include
+  ${CMAKE_BINARY_DIR}/include
   ${LLVM_INCLUDE_DIRS}
   ${MLIR_INCLUDE_DIRS}
 )
-
-
 add_definitions(${LLVM_DEFINITIONS})
+
+# ------------------------------------------------------------------------------
+# Project configuration
+# ------------------------------------------------------------------------------
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # ------------------------------------------------------------------------------
 # Subdirectories
@@ -40,3 +44,5 @@ add_definitions(${LLVM_DEFINITIONS})
 
 add_subdirectory(lib)
 add_subdirectory(tools)
+add_subdirectory(include)
+add_subdirectory(lit_tests)
