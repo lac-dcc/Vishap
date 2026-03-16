@@ -35,6 +35,10 @@ private:
 
   LogicalResult visitAddOp(linalg::AddOp addOp);
 
+  LogicalResult visitClamp(linalg::GenericOp clamp, double clampValue);
+
+  LogicalResult visitGenericOp(linalg::GenericOp genericOp);
+
   LogicalResult visitOperation(Operation *op);
 
 public:

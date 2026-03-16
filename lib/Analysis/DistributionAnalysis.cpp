@@ -1,6 +1,7 @@
 #include "Analysis/DistributionAnalysis.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
+#include <cmath>
 
 namespace mlir::vishap {
 namespace {
@@ -84,8 +85,8 @@ LogicalResult DistributionAnalysis::visitAddOp(linalg::AddOp addOp) {
   auto inputs = addOp.getInputs();
   assert(inputs.size() == 2 && "Expected linalg.add to have exactly 2 inputs");
 
-  const Distribution *dist1 = getDistribution(inputs[0]);
-  const Distribution *dist2 = getDistribution(inputs[1]);
+  const auto *dist1 = getDistribution(inputs[0]);
+  const auto *dist2 = getDistribution(inputs[1]);
   if (!dist1 || !dist2) {
     // If we don't have distribution info for one of the inputs, we can't
     // compute the distribution for the output.
@@ -111,12 +112,99 @@ LogicalResult DistributionAnalysis::visitAddOp(linalg::AddOp addOp) {
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitClamp(linalg::GenericOp clamp,
+                                               double clampValue) {
+  auto inputs = clamp.getInputs();
+  if (inputs.size() != 1) {
+    return clamp->emitError() << "Expected clamp to have exactly 1 input";
+  }
+
+  auto outputs = clamp.getOutputs();
+  if (outputs.size() != 1) {
+    return clamp->emitError() << "Expected clamp to have exactly 1 output";
+  }
+
+  const auto *inputDist = getDistribution(inputs[0]);
+
+  double sigma = std::sqrt(inputDist->variance);
+  double alpha = (clampValue - inputDist->mean) / sigma;
+
+  // 1. Calculate probabilities (CDF and PDF)
+  double cdf = 0.5 * (1 + std::erf(alpha / std::sqrt(2)));
+  double pdf = (1 / std::sqrt(2 * M_PI)) * std::exp(-0.5 * alpha * alpha);
+
+  double clampProb = cdf;
+  double tailProb = 1 - cdf;
+
+  // 2. Calculate tail statistics
+  // Inverse Millis ratio
+  double lam = pdf / tailProb;
+  double tailMean = inputDist->mean + (sigma * lam);
+  double delta = lam * (lam - alpha);
+  double tailVariance = inputDist->variance * (1 - delta);
+
+  // 3. Combine moments
+  // New mean E[X]
+  double rectifiedMean = (clampProb * clampValue) + (tailProb * tailMean);
+
+  // Second moment E[X^2]
+  // For the tail part, E[X^2] = Var + Mean^2
+  double tailSecondMoment = tailVariance + (tailMean * tailMean);
+  // For the clamped part, E[X^2] = C^2
+  double rectifiedSecondMoment =
+      (clampProb * (clampValue * clampValue)) + (tailProb * tailSecondMoment);
+
+  // Variance Var[X] = E[X^2] - (E[X])^2
+  double rectifiedVariance =
+      rectifiedSecondMoment - (rectifiedMean * rectifiedMean);
+
+  Distribution outputDist;
+  outputDist.min = std::max(inputDist->min, clampValue);
+  outputDist.max = std::max(inputDist->max, clampValue);
+  outputDist.mean = rectifiedMean;
+  outputDist.variance = rectifiedVariance;
+
+  this->distributionMap[clamp.getResult(0)] = outputDist;
+  this->analyzedOperations.insert(clamp.getOperation());
+
+  return success();
+}
+
+LogicalResult
+DistributionAnalysis::visitGenericOp(linalg::GenericOp genericOp) {
+  auto body = genericOp.getBody();
+
+  auto &ops = body->getOperations();
+  if (ops.size() != 3) {
+    LLVM_DEBUG(llvm::dbgs() << "Generic op does not match expected pattern\n");
+    return success();
+  }
+
+  // FIXME: this is a hack to identify linalg.generic ops that implement other
+  // ops. Ideally, the analysis should work at a higher abstraction level,
+  // where it would be trivial to identify computational graph operations, but
+  // this is not the case with linalg.
+
+  // FIXME: should we check which constant is used for clamping? For now, assume
+  // it is 0.
+  auto it = ops.begin();
+  if (llvm::isa<arith::CmpFOp>(*it) &&
+      llvm::isa<arith::SelectOp>(*std::next(it))) {
+    return visitClamp(genericOp, /* clampValue= */ 0.0);
+  }
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
       .Case<arith::ConstantOp>(
           [&](arith::ConstantOp constOp) { return visitConstantOp(constOp); })
       .Case<linalg::AddOp>(
           [&](linalg::AddOp addOp) { return visitAddOp(addOp); })
+      .Case<linalg::GenericOp>([&](linalg::GenericOp genericOp) {
+        return visitGenericOp(genericOp);
+      })
       .Default([&](Operation *) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities.
