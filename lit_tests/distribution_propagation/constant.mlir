@@ -11,9 +11,9 @@ func.func @same_values() -> tensor<2x2xf64> {
 // CHECK-SAME:    ]
 // CHECK-NEXT:    return
 
-func.func @different_values() -> tensor<2x2xf64> {
-  %cst = arith.constant dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xf64>
-  return %cst : tensor<2x2xf64>
+func.func @different_values() -> tensor<2x2xf32> {
+  %cst = arith.constant dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xf32>
+  return %cst : tensor<2x2xf32>
 }
 // CHECK-LABEL: func.func @different_values
 // CHECK-NEXT:    arith.constant

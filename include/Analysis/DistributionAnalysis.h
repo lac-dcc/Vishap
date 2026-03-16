@@ -3,6 +3,7 @@
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -31,6 +32,8 @@ private:
   llvm::DenseMap<Value, Distribution> distributionMap;
 
   LogicalResult visitConstantOp(arith::ConstantOp constOp);
+
+  LogicalResult visitAddOp(linalg::AddOp addOp);
 
   LogicalResult visitOperation(Operation *op);
 
