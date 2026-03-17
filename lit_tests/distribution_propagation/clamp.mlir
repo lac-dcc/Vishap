@@ -1,4 +1,4 @@
-// RUN: vishap-opt --distribution-propagation %s | FileCheck %s
+// RUN: vishap-opt --annotate-distributions %s | FileCheck %s
 
 #map = affine_map<(d0, d1) -> (d0, d1)>
 
