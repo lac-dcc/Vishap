@@ -12,9 +12,9 @@ func.func @add() -> tensor<2x2xf32> {
 // CHECK-NEXT:    arith.constant
 // CHECK-NEXT:    tensor.empty
 // CHECK-NEXT:    linalg.add
-// CHECK-SAME:    vishap.distribution = [
-// CHECK-SAME:      [2.000000e+00, 8.000000e+00, 5.000000e+00, 2.500000e+00]
-// CHECK-SAME:    ]
+// CHECK-SAME:      vishap.distribution = [
+// CHECK-SAME:        [2.000000e+00, 8.000000e+00, 5.000000e+00, 2.500000e+00]
+// CHECK-SAME:      ]
 // CHECK-NEXT:    return
 
 func.func @same_values() -> tensor<2x2xf64> {
@@ -29,7 +29,7 @@ func.func @same_values() -> tensor<2x2xf64> {
 // CHECK-NEXT:    arith.constant
 // CHECK-NEXT:    tensor.empty
 // CHECK-NEXT:    linalg.add
-// CHECK-SAME:    vishap.distribution = [
-// CHECK-SAME:      [2.000000e+00, 2.000000e+00, 2.000000e+00, 0.000000e+00]
-// CHECK-SAME:    ]
+// CHECK-SAME:      vishap.distribution = [
+// CHECK-SAME:        [2.000000e+00, 2.000000e+00, 2.000000e+00, 0.000000e+00]
+// CHECK-SAME:      ]
 // CHECK-NEXT:    return
