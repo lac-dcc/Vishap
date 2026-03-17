@@ -1,4 +1,5 @@
 #include "Analysis/DistributionAnalysis.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include <cmath>
@@ -77,7 +78,7 @@ LogicalResult DistributionAnalysis::visitConstantOp(arith::ConstantOp constOp) {
     }
   }
 
-  this->analyzedOperations.insert(constOp.getOperation());
+  this->analyzedOperations.insert(constOp);
   return success();
 }
 
@@ -90,9 +91,8 @@ LogicalResult DistributionAnalysis::visitAddOp(linalg::AddOp addOp) {
   if (!dist1 || !dist2) {
     // If we don't have distribution info for one of the inputs, we can't
     // compute the distribution for the output.
-    return addOp.emitWarning()
-           << "Missing distribution info for one of the inputs, skipping "
-              "distribution analysis for this operation";
+    return addOp.emitError()
+           << "Missing distribution info for at least one of the inputs.";
   }
 
   Distribution outputDist;
@@ -107,7 +107,7 @@ LogicalResult DistributionAnalysis::visitAddOp(linalg::AddOp addOp) {
          "Expected linalg.add to have exactly one result");
 
   distributionMap[addOp.getResult(0)] = outputDist;
-  this->analyzedOperations.insert(addOp.getOperation());
+  this->analyzedOperations.insert(addOp);
 
   return success();
 }
@@ -165,7 +165,25 @@ LogicalResult DistributionAnalysis::visitClamp(linalg::GenericOp clamp,
   outputDist.variance = rectifiedVariance;
 
   this->distributionMap[clamp.getResult(0)] = outputDist;
-  this->analyzedOperations.insert(clamp.getOperation());
+  this->analyzedOperations.insert(clamp);
+
+  return success();
+}
+
+LogicalResult
+DistributionAnalysis::visitElementwiseIdentityOp(linalg::LinalgOp op) {
+  if (!op.isSingleInputOutput()) {
+    return op.emitError() << "Expected an elementwise operation with exactly "
+                             "one input and one output";
+  }
+
+  const auto *inputDist = getDistribution(op->getOperand(0));
+  if (!inputDist) {
+    return op.emitError() << "Missing distribution info for input.";
+  }
+
+  distributionMap[op->getResult(0)] = *inputDist;
+  this->analyzedOperations.insert(op);
 
   return success();
 }
@@ -204,6 +222,9 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
           [&](linalg::AddOp addOp) { return visitAddOp(addOp); })
       .Case<linalg::GenericOp>([&](linalg::GenericOp genericOp) {
         return visitGenericOp(genericOp);
+      })
+      .Case<linalg::BroadcastOp>([&](linalg::BroadcastOp broadcastOp) {
+        return visitElementwiseIdentityOp(broadcastOp);
       })
       .Default([&](Operation *) {
         // FIXME: the default behavior should be for unsupported ops to act as

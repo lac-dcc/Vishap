@@ -4,6 +4,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -38,6 +39,9 @@ private:
   LogicalResult visitClamp(linalg::GenericOp clamp, double clampValue);
 
   LogicalResult visitGenericOp(linalg::GenericOp genericOp);
+
+  /// Propagate distribution for a generic element-wise linalg operation
+  LogicalResult visitElementwiseIdentityOp(linalg::LinalgOp op);
 
   LogicalResult visitOperation(Operation *op);
 
