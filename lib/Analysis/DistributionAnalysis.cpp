@@ -1,4 +1,5 @@
 #include "Analysis/DistributionAnalysis.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
@@ -225,6 +226,9 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       })
       .Case<linalg::BroadcastOp>([&](linalg::BroadcastOp broadcastOp) {
         return visitElementwiseIdentityOp(broadcastOp);
+      })
+      .Case<linalg::TransposeOp>([&](linalg::TransposeOp transposeOp) {
+        return visitElementwiseIdentityOp(transposeOp);
       })
       .Default([&](Operation *) {
         // FIXME: the default behavior should be for unsupported ops to act as
