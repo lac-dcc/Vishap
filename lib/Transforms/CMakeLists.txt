@@ -1,5 +1,5 @@
 add_mlir_library(VishapTransforms
-  DistributionPropagation.cpp
+  AnnotateDistributions.cpp
 
   DEPENDS
   VishapTransformsPassIncGen

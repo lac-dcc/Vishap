@@ -12,7 +12,7 @@ int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);
 
-  mlir::vishap::registerDistributionPropagationPass();
+  mlir::vishap::registerAnnotateDistributionsPass();
 
   return mlir::asMainReturnCode(mlir::MlirOptMain(
       argc, argv, "Vishap - tensor values distribution propagation\n",

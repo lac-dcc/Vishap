@@ -1,4 +1,4 @@
-// RUN: vishap-opt --distribution-propagation %s | FileCheck %s
+// RUN: vishap-opt --annotate-distributions %s | FileCheck %s
 
 func.func @same_values() -> tensor<2x2xf64> {
   %cst = arith.constant dense<[[1.0, 1.0], [1.0, 1.0]]> : tensor<2x2xf64>

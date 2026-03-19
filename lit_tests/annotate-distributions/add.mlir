@@ -1,4 +1,4 @@
-// RUN: vishap-opt --distribution-propagation %s | FileCheck %s
+// RUN: vishap-opt --annotate-distributions %s | FileCheck %s
 
 func.func @add() -> tensor<2x2xf32> {
   %0 = arith.constant dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xf32>

@@ -3,13 +3,13 @@
 #include "llvm/ADT/SmallVector.h"
 
 namespace mlir::vishap {
-#define GEN_PASS_DEF_DISTRIBUTIONPROPAGATIONPASS
+#define GEN_PASS_DEF_ANNOTATEDISTRIBUTIONSPASS
 #include "Transforms/Passes.h.inc"
 
 namespace {
-class DistributionPropagationPass
-    : public impl::DistributionPropagationPassBase<
-          DistributionPropagationPass> {
+class AnnotateDistributionsPass
+    : public impl::AnnotateDistributionsPassBase<
+          AnnotateDistributionsPass> {
 public:
   using Base::Base;
 
