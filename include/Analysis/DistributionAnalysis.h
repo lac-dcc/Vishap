@@ -43,6 +43,8 @@ private:
   /// Propagate distribution for a generic unary linalg operation
   LogicalResult visitUnaryIdentityOp(linalg::LinalgOp op);
 
+  LogicalResult visitMatmul(linalg::MatmulOp matmulOp);
+
   LogicalResult visitOperation(Operation *op);
 
 public:

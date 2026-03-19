@@ -1,6 +1,4 @@
 #include "Analysis/DistributionAnalysis.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include <cmath>
@@ -214,6 +212,48 @@ DistributionAnalysis::visitGenericOp(linalg::GenericOp genericOp) {
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitMatmul(linalg::MatmulOp matmulOp) {
+  auto inputs = matmulOp.getInputs();
+  assert(inputs.size() == 2 &&
+         "Expected linalg.matmul to have exactly 2 inputs");
+
+  const auto *dist1 = getDistribution(inputs[0]);
+  const auto *dist2 = getDistribution(inputs[1]);
+  if (!dist1 || !dist2) {
+    // If we don't have distribution info for one of the inputs, we can't
+    // compute the distribution for the output.
+    return matmulOp.emitError()
+           << "Missing distribution info for at least one of the inputs.";
+  }
+
+  auto innerDim =
+      llvm::cast<ShapedType>(inputs[1].getType()).getShape().front();
+
+  Distribution outputDist;
+  // Assume that the mean of each element product is dist1->mean * dist2->mean.
+  // Moreover, for each element in the output, we sum innerDim values.
+  outputDist.mean = innerDim * dist1->mean * dist2->mean;
+
+  // Variance of a product of independent variables
+  double varTerm = (dist1->variance * dist2->variance) +
+                   (dist1->variance * dist2->mean * dist2->mean) +
+                   (dist2->variance * dist1->mean * dist1->mean);
+  // Final estimate
+  outputDist.variance = innerDim * varTerm;
+
+  // FIXME: We try to avoid gross overestimations by using a fixed number of
+  // standard deviations from the mean. This is heuristic may be incorrect or
+  // unsound. We need to test it empirically, or try a more dynamic approach.
+  constexpr double delta = 6.0;
+  outputDist.min = outputDist.mean - delta * std::sqrt(outputDist.variance);
+  outputDist.max = outputDist.mean + delta * std::sqrt(outputDist.variance);
+
+  distributionMap[matmulOp.getResult(0)] = outputDist;
+  this->analyzedOperations.insert(matmulOp);
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
       .Case<arith::ConstantOp>(
@@ -229,6 +269,8 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       .Case<linalg::TransposeOp>([&](linalg::TransposeOp transposeOp) {
         return visitUnaryIdentityOp(transposeOp);
       })
+      .Case<linalg::MatmulOp>(
+          [&](linalg::MatmulOp matmulOp) { return visitMatmul(matmulOp); })
       .Default([&](Operation *) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities.
