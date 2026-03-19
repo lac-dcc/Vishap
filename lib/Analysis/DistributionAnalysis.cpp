@@ -171,10 +171,9 @@ LogicalResult DistributionAnalysis::visitClamp(linalg::GenericOp clamp,
   return success();
 }
 
-LogicalResult
-DistributionAnalysis::visitElementwiseIdentityOp(linalg::LinalgOp op) {
+LogicalResult DistributionAnalysis::visitUnaryIdentityOp(linalg::LinalgOp op) {
   if (!op.isSingleInputOutput()) {
-    return op.emitError() << "Expected an elementwise operation with exactly "
+    return op.emitError() << "Expected unary operation with exactly "
                              "one input and one output";
   }
 
@@ -225,10 +224,10 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
         return visitGenericOp(genericOp);
       })
       .Case<linalg::BroadcastOp>([&](linalg::BroadcastOp broadcastOp) {
-        return visitElementwiseIdentityOp(broadcastOp);
+        return visitUnaryIdentityOp(broadcastOp);
       })
       .Case<linalg::TransposeOp>([&](linalg::TransposeOp transposeOp) {
-        return visitElementwiseIdentityOp(transposeOp);
+        return visitUnaryIdentityOp(transposeOp);
       })
       .Default([&](Operation *) {
         // FIXME: the default behavior should be for unsupported ops to act as

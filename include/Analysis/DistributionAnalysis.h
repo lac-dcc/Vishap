@@ -40,8 +40,8 @@ private:
 
   LogicalResult visitGenericOp(linalg::GenericOp genericOp);
 
-  /// Propagate distribution for a generic element-wise linalg operation
-  LogicalResult visitElementwiseIdentityOp(linalg::LinalgOp op);
+  /// Propagate distribution for a generic unary linalg operation
+  LogicalResult visitUnaryIdentityOp(linalg::LinalgOp op);
 
   LogicalResult visitOperation(Operation *op);
 
