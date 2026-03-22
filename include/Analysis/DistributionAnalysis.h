@@ -12,6 +12,9 @@
 
 namespace mlir::vishap {
 
+/// Attribute name for function arguments distribution info.
+constexpr char kArgsDistributionAttrName[] = "vishap.args_distribution";
+/// Attribute name for operations results distribution info.
 constexpr char kDistributionAttrName[] = "vishap.distribution";
 
 struct Distribution {
@@ -45,7 +48,12 @@ private:
 
   LogicalResult visitMatmul(linalg::MatmulOp matmulOp);
 
+  LogicalResult visitConv2D(linalg::Conv2DNchwFchwOp convOp);
+
   LogicalResult visitOperation(Operation *op);
+
+  /// Get distributions for function args, if available.
+  LogicalResult getDistributionForArgs(func::FuncOp funcOp);
 
 public:
   LogicalResult run(func::FuncOp func);
@@ -54,14 +62,7 @@ public:
     return analyzedOperations;
   }
 
-  const Distribution *getDistribution(Value value) const {
-    auto it = distributionMap.find(value);
-    if (it == distributionMap.end()) {
-      return nullptr;
-    }
-
-    return &it->second;
-  }
+  FailureOr<const Distribution*> getDistribution(Value value);
 };
 
 } // namespace mlir::vishap
