@@ -50,6 +50,8 @@ private:
 
   LogicalResult visitConv2D(linalg::Conv2DNchwFchwOp convOp);
 
+  LogicalResult visitFill(linalg::FillOp fillOp);
+
   LogicalResult visitOperation(Operation *op);
 
   /// Get distributions for function args, if available.
