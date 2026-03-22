@@ -4,6 +4,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include <cmath>
+#include <numeric>
 
 namespace mlir::vishap {
 namespace {
@@ -334,6 +335,61 @@ LogicalResult DistributionAnalysis::visitFill(linalg::FillOp fillOp) {
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitPad(tensor::PadOp padOp) {
+  auto source = padOp.getSource();
+  auto sourceDistOrFailure = getDistribution(source);
+  if (failed(sourceDistOrFailure)) {
+    return padOp.emitError() << "Missing distribution info for source.";
+  }
+  const auto *sourceDist = *sourceDistOrFailure;
+
+  // Get value used for padding
+  auto &ops = padOp.getBody()->getOperations();
+  if (ops.size() != 1) {
+    return padOp.emitError()
+           << "Expected pad body to have exactly 1 operation (tensor.yield)";
+  }
+  auto constOp = llvm::cast<tensor::YieldOp>(ops.back())
+                     .getValue()
+                     .getDefiningOp<arith::ConstantOp>();
+  if (!constOp || !constOp.getType().isFloat()) {
+    return padOp.emitError() << "Expected pad value to be defined by a "
+                                "floating point scalar constant";
+  }
+  double padValue =
+      llvm::cast<FloatAttr>(constOp.getValue()).getValueAsDouble();
+
+  // Compute size of source tensor
+  auto sourceShape = source.getType().getShape();
+  size_t tensorSize = std::accumulate(sourceShape.begin(), sourceShape.end(), 1,
+                                      std::multiplies<size_t>());
+
+  // Compute size of padding
+  auto outShape = padOp.getResult().getType().getShape();
+  size_t outSize = std::accumulate(outShape.begin(), outShape.end(), 1,
+                                   std::multiplies<size_t>());
+  size_t padSize = outSize - tensorSize;
+
+  auto newSize = tensorSize + padSize;
+  double originalRatio = static_cast<double>(tensorSize) / newSize;
+  double padRatio = static_cast<double>(padSize) / newSize;
+
+  Distribution outputDist;
+  outputDist.mean = (originalRatio * sourceDist->mean) + (padRatio * padValue);
+  outputDist.variance =
+      (originalRatio * sourceDist->variance) +
+      originalRatio * (sourceDist->mean - outputDist.mean) *
+          (sourceDist->mean - outputDist.mean) +
+      padRatio * (padValue - outputDist.mean) * (padValue - outputDist.mean);
+  outputDist.min = std::min(sourceDist->min, padValue);
+  outputDist.max = std::max(sourceDist->max, padValue);
+
+  distributionMap[padOp.getResult()] = outputDist;
+  this->analyzedOperations.insert(padOp);
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
       .Case<arith::ConstantOp>(
@@ -355,6 +411,7 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
           [&](linalg::Conv2DNchwFchwOp convOp) { return visitConv2D(convOp); })
       .Case<linalg::FillOp>(
           [&](linalg::FillOp fillOp) { return visitFill(fillOp); })
+      .Case<tensor::PadOp>([&](tensor::PadOp padOp) { return visitPad(padOp); })
       .Default([&](Operation *op) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities?
