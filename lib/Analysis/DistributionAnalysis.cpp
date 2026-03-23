@@ -242,7 +242,7 @@ Distribution getMatrixMultiplicationDistribution(long contractionSize,
   outputDist.variance = contractionSize * varTerm;
 
   // FIXME: We try to avoid gross overestimations by using a fixed number of
-  // standard deviations from the mean. This is heuristic may be incorrect or
+  // standard deviations from the mean. This heuristic may be incorrect or
   // unsound. We need to test it empirically, or try a more dynamic approach.
   constexpr double delta = 6.0;
   outputDist.min = outputDist.mean - delta * std::sqrt(outputDist.variance);
