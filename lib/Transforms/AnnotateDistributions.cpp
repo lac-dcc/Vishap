@@ -27,12 +27,14 @@ public:
     for (auto *op : analysis.getAnalyzedOperations()) {
       llvm::SmallVector<Attribute, 3> distributions;
       for (auto result : op->getResults()) {
-        if (auto dist = analysis.getDistribution(result)) {
-          auto distArray = distributionToArrayAttr(builder, *dist);
-          distributions.push_back(ArrayAttr::get(ctx, distArray));
-        } else {
-          distributions.push_back(UnitAttr::get(ctx));
+        auto distOrFailure = analysis.getDistribution(result);
+        if (failed(distOrFailure)) {
+          signalPassFailure();
+          return;
         }
+
+        auto distArray = distributionToArrayAttr(builder, *(*distOrFailure));
+        distributions.push_back(ArrayAttr::get(ctx, distArray));
       }
 
       op->setAttr(kDistributionAttrName, ArrayAttr::get(ctx, distributions));

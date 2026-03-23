@@ -1,6 +1,6 @@
 #include "Analysis/DistributionAnalysis.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/Diagnostics.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include <cmath>
@@ -40,6 +40,8 @@ Distribution computeDistribution(DenseElementsAttr denseAttr) {
 }
 } // namespace
 
+/// Convert \p distribution to an array attribute that can be attached to an
+/// operation.
 std::array<Attribute, 4>
 distributionToArrayAttr(Builder &builder, const Distribution &distribution) {
   return {builder.getF64FloatAttr(distribution.min),
@@ -87,21 +89,24 @@ LogicalResult DistributionAnalysis::visitAddOp(linalg::AddOp addOp) {
   auto inputs = addOp.getInputs();
   assert(inputs.size() == 2 && "Expected linalg.add to have exactly 2 inputs");
 
-  const auto *dist1 = getDistribution(inputs[0]);
-  const auto *dist2 = getDistribution(inputs[1]);
-  if (!dist1 || !dist2) {
+  auto lhsDistOrFailure = getDistribution(inputs[0]);
+  auto rhsDistOrFailure = getDistribution(inputs[1]);
+  if (failed(lhsDistOrFailure) || failed(rhsDistOrFailure)) {
     // If we don't have distribution info for one of the inputs, we can't
     // compute the distribution for the output.
     return addOp.emitError()
            << "Missing distribution info for at least one of the inputs.";
   }
 
+  const auto *lhsDist = *lhsDistOrFailure;
+  const auto *rhsDist = *rhsDistOrFailure;
+
   Distribution outputDist;
-  outputDist.min = dist1->min + dist2->min;
-  outputDist.max = dist1->max + dist2->max;
+  outputDist.min = lhsDist->min + rhsDist->min;
+  outputDist.max = lhsDist->max + rhsDist->max;
   // Premise: inputs are independent and are described by a normal distribution
-  outputDist.mean = dist1->mean + dist2->mean;
-  outputDist.variance = dist1->variance + dist2->variance;
+  outputDist.mean = lhsDist->mean + rhsDist->mean;
+  outputDist.variance = lhsDist->variance + rhsDist->variance;
 
   // Sanity check
   assert(addOp->getNumResults() == 1 &&
@@ -125,7 +130,12 @@ LogicalResult DistributionAnalysis::visitClamp(linalg::GenericOp clamp,
     return clamp->emitError() << "Expected clamp to have exactly 1 output";
   }
 
-  const auto *inputDist = getDistribution(inputs[0]);
+  auto inputDistOrFailure = getDistribution(inputs[0]);
+  if (failed(inputDistOrFailure)) {
+    return clamp.emitError() << "Missing distribution info for input.";
+  }
+
+  const auto *inputDist = *inputDistOrFailure;
 
   double sigma = std::sqrt(inputDist->variance);
   double alpha = (clampValue - inputDist->mean) / sigma;
@@ -177,12 +187,12 @@ LogicalResult DistributionAnalysis::visitUnaryIdentityOp(linalg::LinalgOp op) {
                              "one input and one output";
   }
 
-  const auto *inputDist = getDistribution(op->getOperand(0));
-  if (!inputDist) {
+  auto inputDistOrFailure = getDistribution(op->getOperand(0));
+  if (failed(inputDistOrFailure)) {
     return op.emitError() << "Missing distribution info for input.";
   }
 
-  distributionMap[op->getResult(0)] = *inputDist;
+  distributionMap[op->getResult(0)] = *(*inputDistOrFailure);
   this->analyzedOperations.insert(op);
 
   return success();
@@ -214,6 +224,96 @@ DistributionAnalysis::visitGenericOp(linalg::GenericOp genericOp) {
   return success();
 }
 
+/// Propagate distribution for a matrix multiplication-like operation, given the
+/// distribution of the inputs and the size of the contraction dimension.
+Distribution getMatrixMultiplicationDistribution(long contractionSize,
+                                                 const Distribution *dist1,
+                                                 const Distribution *dist2) {
+  Distribution outputDist;
+  // Assume that the mean of each element product is dist1.mean * dist2.mean.
+  // Moreover, for each element in the output, we sum contractionSize values.
+  outputDist.mean = contractionSize * dist1->mean * dist2->mean;
+
+  // Variance of a product of independent variables
+  double varTerm = (dist1->variance * dist2->variance) +
+                   (dist1->variance * dist2->mean * dist2->mean) +
+                   (dist2->variance * dist1->mean * dist1->mean);
+  // Final estimate
+  outputDist.variance = contractionSize * varTerm;
+
+  // FIXME: We try to avoid gross overestimations by using a fixed number of
+  // standard deviations from the mean. This heuristic may be incorrect or
+  // unsound. We need to test it empirically, or try a more dynamic approach.
+  constexpr double delta = 6.0;
+  outputDist.min = outputDist.mean - delta * std::sqrt(outputDist.variance);
+  outputDist.max = outputDist.mean + delta * std::sqrt(outputDist.variance);
+
+  return outputDist;
+}
+
+LogicalResult DistributionAnalysis::visitMatmul(linalg::MatmulOp matmulOp) {
+  auto inputs = matmulOp.getInputs();
+  assert(inputs.size() == 2 &&
+         "Expected linalg.matmul to have exactly 2 inputs");
+
+  auto lhsDistOrFailure = getDistribution(inputs[0]);
+  auto rhsDistOrFailure = getDistribution(inputs[1]);
+  if (failed(lhsDistOrFailure) || failed(rhsDistOrFailure)) {
+    // If we don't have distribution info for one of the inputs, we can't
+    // compute the distribution for the output.
+    return matmulOp.emitError()
+           << "Missing distribution info for at least one of the inputs.";
+  }
+
+  const auto *lhsDist = *lhsDistOrFailure;
+  const auto *rhsDist = *rhsDistOrFailure;
+  auto innerDim =
+      llvm::cast<ShapedType>(inputs[1].getType()).getShape().front();
+
+  Distribution outputDist =
+      getMatrixMultiplicationDistribution(innerDim, lhsDist, rhsDist);
+
+  distributionMap[matmulOp.getResult(0)] = outputDist;
+  this->analyzedOperations.insert(matmulOp);
+
+  return success();
+}
+
+LogicalResult
+DistributionAnalysis::visitConv2D(linalg::Conv2DNchwFchwOp convOp) {
+  auto inputs = convOp.getInputs();
+  assert(inputs.size() == 2 &&
+         "Expected linalg.conv_2d_nchw_fchw to have exactly 2 inputs");
+
+  auto inputDistOrFailure = getDistribution(inputs[0]);
+  auto kernelDistOrFailure = getDistribution(inputs[1]);
+  if (failed(inputDistOrFailure) || failed(kernelDistOrFailure)) {
+    return convOp.emitError()
+           << "Missing distribution info for at least one of the inputs.";
+  }
+  const auto *inputDist = *inputDistOrFailure;
+  const auto *kernelDist = *kernelDistOrFailure;
+
+  auto inputShape = llvm::cast<ShapedType>(inputs[0].getType()).getShape();
+  auto kernelShape = llvm::cast<ShapedType>(inputs[1].getType()).getShape();
+
+  auto inputChannels = inputShape[1];
+  auto kernelHeight = kernelShape[2];
+  auto kernelWidth = kernelShape[3];
+
+  // This is the size of the number of elements in the "sliding window" of
+  // convolution
+  auto contractionSize = inputChannels * kernelHeight * kernelWidth;
+
+  Distribution outputDist = getMatrixMultiplicationDistribution(
+      contractionSize, inputDist, kernelDist);
+
+  distributionMap[convOp.getResult(0)] = outputDist;
+  this->analyzedOperations.insert(convOp);
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
       .Case<arith::ConstantOp>(
@@ -229,16 +329,91 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       .Case<linalg::TransposeOp>([&](linalg::TransposeOp transposeOp) {
         return visitUnaryIdentityOp(transposeOp);
       })
-      .Default([&](Operation *) {
+      .Case<linalg::MatmulOp>(
+          [&](linalg::MatmulOp matmulOp) { return visitMatmul(matmulOp); })
+      .Case<linalg::Conv2DNchwFchwOp>(
+          [&](linalg::Conv2DNchwFchwOp convOp) { return visitConv2D(convOp); })
+      .Default([&](Operation *op) {
         // FIXME: the default behavior should be for unsupported ops to act as
-        // identities.
+        // identities?
         LLVM_DEBUG(llvm::dbgs()
                    << "Unsupported operation: " << op->getName() << "\n");
         return success();
       });
 }
 
+FailureOr<const Distribution *>
+DistributionAnalysis::getDistribution(Value value) {
+  auto it = distributionMap.find(value);
+  if (it == distributionMap.end()) {
+    return mlir::emitError(value.getLoc())
+           << "Missing distribution info for value: " << value;
+  }
+
+  return &it->second;
+}
+
+/// Convert \p arrayAttr to a Distribution struct. Emit an error and return
+/// failure if the attribute is not well-formed.
+FailureOr<Distribution> arrayAttrToDistribution(Location loc,
+                                                ArrayAttr arrayAttr) {
+  if (arrayAttr.size() != 4) {
+    mlir::emitError(loc)
+        << "Expected array attribute of size 4 for distribution info, got "
+        << arrayAttr.size();
+    return failure();
+  }
+
+  for (auto attr : arrayAttr) {
+    if (!llvm::isa<FloatAttr>(attr)) {
+      return mlir::emitError(loc) << "Expected float type for all values in "
+                                     "distribution attribute";
+    }
+  }
+
+  return Distribution{
+      .min = llvm::cast<FloatAttr>(arrayAttr[0]).getValueAsDouble(),
+      .max = llvm::cast<FloatAttr>(arrayAttr[1]).getValueAsDouble(),
+      .mean = llvm::cast<FloatAttr>(arrayAttr[2]).getValueAsDouble(),
+      .variance = llvm::cast<FloatAttr>(arrayAttr[3]).getValueAsDouble(),
+  };
+}
+
+LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
+  auto distAttr = func->getAttrOfType<ArrayAttr>(kArgsDistributionAttrName);
+  if (!distAttr) {
+    // No distribution info for function arguments, nothing to do.
+    return success();
+  }
+
+  if (func.getNumArguments() != distAttr.size()) {
+    return func->emitError()
+           << "Size of args distribution attribute (" << distAttr.size()
+           << ") must match the number of "
+              "function arguments ("
+           << func.getNumArguments() << ")";
+  }
+
+  for (size_t i = 0; i < distAttr.size(); i++) {
+    auto operandDistAttr = llvm::cast<ArrayAttr>(distAttr[i]);
+    auto distOrFailure =
+        arrayAttrToDistribution(func->getLoc(), operandDistAttr);
+    if (failed(distOrFailure)) {
+      return failure();
+    }
+
+    distributionMap[func.getArgument(i)] = *distOrFailure;
+  }
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::run(func::FuncOp func) {
+  if (failed(getDistributionForArgs(func))) {
+    return func->emitError()
+           << "Failed to get distribution info for function arguments";
+  }
+
   for (auto &op : func.getBody().front().getOperations()) {
     if (failed(visitOperation(&op))) {
       return func->emitError()
