@@ -2,6 +2,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include <cmath>
 #include <numeric>
@@ -390,6 +391,37 @@ LogicalResult DistributionAnalysis::visitPad(tensor::PadOp padOp) {
   return success();
 }
 
+LogicalResult
+DistributionAnalysis::visitSumPooling(linalg::PoolingNchwSumOp poolingOp) {
+  auto inputs = poolingOp.getInputs();
+  assert(inputs.size() == 2 &&
+         "Expected linalg.pooling_nchw_sum to have exactly 2 inputs");
+
+  auto input = inputs[0];
+  auto inputDistOrFailure = getDistribution(input);
+  if (failed(inputDistOrFailure)) {
+    return poolingOp.emitError() << "Missing distribution info for input.";
+  }
+
+  auto kernel = inputs[1];
+  auto kernelShape = llvm::cast<ShapedType>(kernel.getType()).getShape();
+  auto poolingWindowSize = kernelShape[0] * kernelShape[1];
+
+  const auto *inputDist = *inputDistOrFailure;
+  Distribution outputDist = {
+    .min = inputDist->min * poolingWindowSize,
+    .max = inputDist->max * poolingWindowSize,
+    .mean = inputDist->mean * poolingWindowSize,
+    // FIXME: There probably is a more accurate way to estimate this
+    .variance = inputDist->variance * poolingWindowSize
+  };
+
+  distributionMap[poolingOp->getResult(0)] = outputDist;
+  this->analyzedOperations.insert(poolingOp);
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
       .Case<arith::ConstantOp>(
@@ -412,6 +444,9 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       .Case<linalg::FillOp>(
           [&](linalg::FillOp fillOp) { return visitFill(fillOp); })
       .Case<tensor::PadOp>([&](tensor::PadOp padOp) { return visitPad(padOp); })
+      .Case<linalg::PoolingNchwSumOp>([&](linalg::PoolingNchwSumOp poolingOp) {
+        return visitSumPooling(poolingOp);
+      })
       .Default([&](Operation *op) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities?

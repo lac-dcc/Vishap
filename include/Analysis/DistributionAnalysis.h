@@ -9,6 +9,7 @@
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/LogicalResult.h"
 #include <array>
 
 namespace mlir::vishap {
@@ -54,6 +55,8 @@ private:
   LogicalResult visitFill(linalg::FillOp fillOp);
 
   LogicalResult visitPad(tensor::PadOp padOp);
+
+  LogicalResult visitSumPooling(linalg::PoolingNchwSumOp poolingOp);
 
   LogicalResult visitOperation(Operation *op);
 
