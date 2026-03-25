@@ -15,7 +15,7 @@ namespace {
 template <typename T>
 Distribution computeDistribution(DenseElementsAttr denseAttr) {
   double max = std::numeric_limits<double>::lowest();
-  double min = std::numeric_limits<double>::max();
+  double min = std::numeric_limits<double>::infinity();
   double sum = 0.0;
   auto values = denseAttr.getValues<T>();
   for (auto element : values) {
@@ -68,12 +68,12 @@ LogicalResult DistributionAnalysis::visitConstantOp(arith::ConstantOp constOp) {
     Distribution distribution;
     switch (tensorType.getElementType().getIntOrFloatBitWidth()) {
     case 32: {
-      distributionMap[constOp.getResult()] =
+      this->distributionMap[constOp.getResult()] =
           computeDistribution<float>(denseAttr);
       break;
     }
     case 64: {
-      distributionMap[constOp.getResult()] =
+      this->distributionMap[constOp.getResult()] =
           computeDistribution<double>(denseAttr);
       break;
     }
@@ -115,7 +115,7 @@ LogicalResult DistributionAnalysis::visitAddOp(linalg::AddOp addOp) {
   assert(addOp->getNumResults() == 1 &&
          "Expected linalg.add to have exactly one result");
 
-  distributionMap[addOp.getResult(0)] = outputDist;
+  this->distributionMap[addOp.getResult(0)] = outputDist;
   this->analyzedOperations.insert(addOp);
 
   return success();
@@ -194,7 +194,7 @@ LogicalResult DistributionAnalysis::visitUnaryIdentityOp(linalg::LinalgOp op) {
     return op.emitError() << "Missing distribution info for input.";
   }
 
-  distributionMap[op->getResult(0)] = *(*inputDistOrFailure);
+  this->distributionMap[op->getResult(0)] = *(*inputDistOrFailure);
   this->analyzedOperations.insert(op);
 
   return success();
@@ -275,7 +275,7 @@ LogicalResult DistributionAnalysis::visitMatmul(linalg::MatmulOp matmulOp) {
   Distribution outputDist =
       getMatrixMultiplicationDistribution(innerDim, lhsDist, rhsDist);
 
-  distributionMap[matmulOp.getResult(0)] = outputDist;
+  this->distributionMap[matmulOp.getResult(0)] = outputDist;
   this->analyzedOperations.insert(matmulOp);
 
   return success();
@@ -310,7 +310,7 @@ DistributionAnalysis::visitConv2D(linalg::Conv2DNchwFchwOp convOp) {
   Distribution outputDist = getMatrixMultiplicationDistribution(
       contractionSize, inputDist, kernelDist);
 
-  distributionMap[convOp.getResult(0)] = outputDist;
+  this->distributionMap[convOp.getResult(0)] = outputDist;
   this->analyzedOperations.insert(convOp);
 
   return success();
@@ -331,7 +331,7 @@ LogicalResult DistributionAnalysis::visitFill(linalg::FillOp fillOp) {
   Distribution outputDist = {
       .min = fillValue, .max = fillValue, .mean = fillValue, .variance = 0.0};
 
-  distributionMap[fillOp.getResult(0)] = outputDist;
+  this->distributionMap[fillOp.getResult(0)] = outputDist;
   this->analyzedOperations.insert(fillOp);
 
   return success();
@@ -386,7 +386,7 @@ LogicalResult DistributionAnalysis::visitPad(tensor::PadOp padOp) {
   outputDist.min = std::min(sourceDist->min, padValue);
   outputDist.max = std::max(sourceDist->max, padValue);
 
-  distributionMap[padOp.getResult()] = outputDist;
+  this->distributionMap[padOp.getResult()] = outputDist;
   this->analyzedOperations.insert(padOp);
 
   return success();
@@ -410,15 +410,63 @@ DistributionAnalysis::visitSumPooling(linalg::PoolingNchwSumOp poolingOp) {
 
   const auto *inputDist = *inputDistOrFailure;
   Distribution outputDist = {
-    .min = inputDist->min * poolingWindowSize,
-    .max = inputDist->max * poolingWindowSize,
-    .mean = inputDist->mean * poolingWindowSize,
-    // FIXME: There probably is a more accurate way to estimate this
-    .variance = inputDist->variance * poolingWindowSize
-  };
+      .min = inputDist->min * poolingWindowSize,
+      .max = inputDist->max * poolingWindowSize,
+      .mean = inputDist->mean * poolingWindowSize,
+      // FIXME: There probably is a more accurate way to estimate this
+      .variance = inputDist->variance * poolingWindowSize};
 
-  distributionMap[poolingOp->getResult(0)] = outputDist;
+  this->distributionMap[poolingOp->getResult(0)] = outputDist;
   this->analyzedOperations.insert(poolingOp);
+
+  return success();
+}
+
+LogicalResult DistributionAnalysis::visitConcat(tensor::ConcatOp concatOp) {
+  auto axis = concatOp.getDim();
+
+  llvm::SmallVector<uint64_t> dims;
+  auto inputs = concatOp.getInputs();
+  uint64_t newDimSize = 0;
+  // Compute size of concatenated dimension
+  for (auto input : inputs) {
+    // FIXME: What to do with dynamic shapes?
+    dims.push_back(llvm::cast<ShapedType>(input.getType()).getDimSize(axis));
+    newDimSize += dims.back();
+  }
+
+  llvm::SmallVector<const Distribution *> dists;
+  double min = std::numeric_limits<double>::infinity();
+  double max = std::numeric_limits<double>::lowest();
+  double mean = 0.;
+  for (const auto [input, dim] : llvm::zip(inputs, dims)) {
+    auto inputDistOrFailure = getDistribution(input);
+    if (failed(inputDistOrFailure)) {
+      return concatOp->emitError()
+             << "Missing distribution info for at least one of the inputs.";
+    }
+
+    const auto *inputDist = *inputDistOrFailure;
+    dists.push_back(inputDist);
+    min = std::min(min, inputDist->min);
+    max = std::max(max, inputDist->max);
+    auto weight = static_cast<double>(dim) / newDimSize;
+    mean += weight * inputDist->mean;
+  }
+
+  double variance = 0.;
+  for (const auto [input, dim, dist] : llvm::zip(inputs, dims, dists)) {
+    auto weight = static_cast<double>(dim) / newDimSize;
+    // Intra-tensor variance + inter-tensor variance
+    variance +=
+        weight * (dist->variance + (dist->mean - mean) * (dist->mean - mean));
+  }
+
+  Distribution outputDist = {
+      .min = min, .max = max, .mean = mean, .variance = variance};
+
+  this->distributionMap[concatOp.getResult()] = outputDist;
+  this->analyzedOperations.insert(concatOp);
 
   return success();
 }
@@ -448,6 +496,8 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       .Case<linalg::PoolingNchwSumOp>([&](linalg::PoolingNchwSumOp poolingOp) {
         return visitSumPooling(poolingOp);
       })
+      .Case<tensor::ConcatOp>(
+          [&](tensor::ConcatOp concatOp) { return visitConcat(concatOp); })
       .Default([&](Operation *op) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities?
@@ -517,7 +567,7 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
       return failure();
     }
 
-    distributionMap[func.getArgument(i)] = *distOrFailure;
+    this->distributionMap[func.getArgument(i)] = *distOrFailure;
   }
 
   return success();

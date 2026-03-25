@@ -1,3 +1,5 @@
+// RUN: vishap-opt --annotate-distributions %s | FileCheck %s
+
 func.func @pooling_nchw_sum(%input: tensor<1x48x32x32xf32>, %kernel: tensor<32x32xf32>) -> tensor<1x48x1x1xf32> 
             attributes {vishap.args_distribution = [[-1.5, 3., 1., 0.5], [0., 1., 1., 0.]]} {
   %out = tensor.empty() : tensor<1x48x1x1xf32>
