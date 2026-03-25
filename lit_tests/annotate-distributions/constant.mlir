@@ -22,6 +22,17 @@ func.func @different_values() -> tensor<2x2xf32> {
 // CHECK-SAME:      ]
 // CHECK-NEXT:    return
 
+func.func @negative_values() -> tensor<2x2xf32> {
+  %cst = arith.constant dense<[[-1.0, -2.0], [-3.0, -4.0]]> : tensor<2x2xf32>
+  return %cst : tensor<2x2xf32>
+}
+// CHECK-LABEL: func.func @negative_values
+// CHECK-NEXT:    arith.constant
+// CHECK-SAME:      vishap.distribution = [
+// CHECK-SAME:        [-4.000000e+00, -1.000000e+00, -2.500000e+00, 1.250000e+00]
+// CHECK-SAME:      ]
+// CHECK-NEXT:    return
+
 func.func @scalar_constant() -> f64 {
   %cst = arith.constant 42.0 : f64
   return %cst : f64

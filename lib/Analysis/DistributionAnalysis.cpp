@@ -5,6 +5,7 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include <cmath>
+#include <limits>
 #include <numeric>
 
 namespace mlir::vishap {
@@ -13,7 +14,7 @@ namespace {
 
 template <typename T>
 Distribution computeDistribution(DenseElementsAttr denseAttr) {
-  double max = std::numeric_limits<double>::min();
+  double max = std::numeric_limits<double>::lowest();
   double min = std::numeric_limits<double>::max();
   double sum = 0.0;
   auto values = denseAttr.getValues<T>();
