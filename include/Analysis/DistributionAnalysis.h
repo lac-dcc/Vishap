@@ -55,6 +55,10 @@ private:
 
   LogicalResult visitPad(tensor::PadOp padOp);
 
+  LogicalResult visitSumPooling(linalg::PoolingNchwSumOp poolingOp);
+
+  LogicalResult visitConcat(tensor::ConcatOp concatOp);
+
   LogicalResult visitOperation(Operation *op);
 
   /// Get distributions for function args, if available.
