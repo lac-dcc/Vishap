@@ -24,12 +24,13 @@ private:
     auto ctx = builder.getContext();
     llvm::SmallVector<Attribute> funcAttrs;
     for (llvm::StringRef inputDist : llvm::split(inputDists, inputSep)) {
-      if (inputDist.empty()) {
+      auto trimedInputDist = inputDist.trim();
+      if (trimedInputDist.empty()) {
         continue;
       }
 
       llvm::SmallVector<Attribute, 4> inputAttrs;
-      for (auto valueStr : llvm::split(inputDist, sep)) {
+      for (auto valueStr : llvm::split(trimedInputDist, sep)) {
         double value;
         if (!valueStr.getAsDouble(value)) {
           inputAttrs.push_back(builder.getF64FloatAttr(value));
@@ -41,7 +42,7 @@ private:
 
       if (inputAttrs.size() != 4) {
         return func.emitError() << "Expected 4 values in distribution, but got "
-                                << inputAttrs.size() << "(" << inputDist << ")";
+                                << inputAttrs.size() << "(" << trimedInputDist << ")";
       }
 
       funcAttrs.push_back(ArrayAttr::get(ctx, inputAttrs));

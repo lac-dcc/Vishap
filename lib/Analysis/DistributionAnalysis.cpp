@@ -125,12 +125,12 @@ LogicalResult DistributionAnalysis::visitClamp(linalg::GenericOp clamp,
                                                double clampValue) {
   auto inputs = clamp.getInputs();
   if (inputs.size() != 1) {
-    return clamp->emitError() << "Expected clamp to have exactly 1 input";
+    return clamp.emitError() << "Expected clamp to have exactly 1 input";
   }
 
   auto outputs = clamp.getOutputs();
   if (outputs.size() != 1) {
-    return clamp->emitError() << "Expected clamp to have exactly 1 output";
+    return clamp.emitError() << "Expected clamp to have exactly 1 output";
   }
 
   auto inputDistOrFailure = getDistribution(inputs[0]);
@@ -442,7 +442,7 @@ LogicalResult DistributionAnalysis::visitConcat(tensor::ConcatOp concatOp) {
   for (const auto [input, dim] : llvm::zip(inputs, dims)) {
     auto inputDistOrFailure = getDistribution(input);
     if (failed(inputDistOrFailure)) {
-      return concatOp->emitError()
+      return concatOp.emitError()
              << "Missing distribution info for at least one of the inputs.";
     }
 
@@ -552,7 +552,7 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
   }
 
   if (func.getNumArguments() != distAttr.size()) {
-    return func->emitError()
+    return func.emitError()
            << "Size of args distribution attribute (" << distAttr.size()
            << ") must match the number of "
               "function arguments ("
@@ -575,13 +575,13 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
 
 LogicalResult DistributionAnalysis::run(func::FuncOp func) {
   if (failed(getDistributionForArgs(func))) {
-    return func->emitError()
+    return func.emitError()
            << "Failed to get distribution info for function arguments";
   }
 
   for (auto &op : func.getBody().front().getOperations()) {
     if (failed(visitOperation(&op))) {
-      return func->emitError()
+      return func.emitError()
              << "Failed to analyze distribution for operation: "
              << op.getName();
     }
