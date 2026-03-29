@@ -9,3 +9,8 @@ func.func @arg_test(%arg0: tensor<1x2x3xf32>, %arg1: tensor<3x2x1xf64>, %arg2: t
 // CHECK-SAME:        [5.000000e+00, 6.000000e+00, 7.000000e+00, 8.000000e+00],
 // CHECK-SAME:        [9.000000e+00, 1.000000e+01, 1.100000e+01, 1.200000e+01]
 // CHECK-SAME:      ]
+// CHECK-SAME:      vishap.distribution = [
+// CHECK-SAME:        [1.000000e+00, 2.000000e+00, 3.000000e+00, 4.000000e+00],
+// CHECK-SAME:        [5.000000e+00, 6.000000e+00, 7.000000e+00, 8.000000e+00],
+// CHECK-SAME:        [9.000000e+00, 1.000000e+01, 1.100000e+01, 1.200000e+01]
+// CHECK-SAME:      ]

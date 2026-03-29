@@ -1,5 +1,6 @@
 #include "Analysis/DistributionAnalysis.h"
 #include "Transforms/Passes.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
@@ -41,8 +42,9 @@ private:
       }
 
       if (inputAttrs.size() != 4) {
-        return func.emitError() << "Expected 4 values in distribution, but got "
-                                << inputAttrs.size() << "(" << trimedInputDist << ")";
+        return func.emitError()
+               << "Expected 4 values in distribution, but got "
+               << inputAttrs.size() << "(" << trimedInputDist << ")";
       }
 
       funcAttrs.push_back(ArrayAttr::get(ctx, inputAttrs));
@@ -90,6 +92,30 @@ public:
       }
 
       op->setAttr(kDistributionAttrName, ArrayAttr::get(ctx, distributions));
+    }
+
+    // Annotate function with distribution info for return values, if available
+    if (auto returnOp = llvm::dyn_cast<func::ReturnOp>(
+            func.getBody().front().getTerminator())) {
+      llvm::SmallVector<Attribute, 3> distributions;
+      for (auto operand : returnOp.getOperands()) {
+        if (!llvm::isa<TensorType>(operand.getType())) {
+          distributions.push_back(builder.getUnitAttr());
+          continue;
+        }
+
+        auto distOrFailure = analysis.getDistribution(operand);
+        if (failed(distOrFailure)) {
+          returnOp.emitError()
+              << "Missing distribution info for return operand";
+          return signalPassFailure();
+        }
+
+        auto distArray = distributionToArrayAttr(builder, *(*distOrFailure));
+        distributions.push_back(ArrayAttr::get(ctx, distArray));
+      }
+
+      func->setAttr(kDistributionAttrName, ArrayAttr::get(ctx, distributions));
     }
   }
 };
