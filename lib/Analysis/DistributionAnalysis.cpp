@@ -183,6 +183,49 @@ LogicalResult DistributionAnalysis::visitClamp(linalg::GenericOp clamp,
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitDivFOp(linalg::GenericOp divOp,
+                                                Value divisor) {
+  auto inputs = divOp.getInputs();
+  if (inputs.size() != 1) {
+    return divOp.emitError() << "Expected division op to have exactly 1 input";
+  }
+
+  auto outputs = divOp.getOutputs();
+  if (outputs.size() != 1) {
+    return divOp.emitError() << "Expected division op to have exactly 1 output";
+  }
+
+  auto inputDistOrFailure = getDistribution(inputs[0]);
+  if (failed(inputDistOrFailure)) {
+    return divOp.emitError() << "Missing distribution info for input.";
+  }
+
+  auto constOp = divisor.getDefiningOp<arith::ConstantOp>();
+  if (!constOp || !constOp.getType().isFloat()) {
+    return divOp.emitError()
+           << "Expected divisor to be defined by a scalar float constant op";
+  }
+
+  double divisorValue =
+      llvm::cast<FloatAttr>(constOp.getValue()).getValueAsDouble();
+  if (divisorValue == 0.0) {
+    return divOp.emitError()
+           << "Division by zero is not supported in distribution analysis";
+  }
+
+  const auto *inputDist = *inputDistOrFailure;
+  Distribution outputDist = {.min = inputDist->min / divisorValue,
+                             .max = inputDist->max / divisorValue,
+                             .mean = inputDist->mean / divisorValue,
+                             .variance = inputDist->variance /
+                                         (divisorValue * divisorValue)};
+
+  this->distributionMap[divOp.getResult(0)] = outputDist;
+  this->analyzedOperations.insert(divOp);
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitUnaryIdentityOp(linalg::LinalgOp op) {
   if (!op.isSingleInputOutput()) {
     return op.emitError() << "Expected unary operation with exactly "
@@ -203,12 +246,7 @@ LogicalResult DistributionAnalysis::visitUnaryIdentityOp(linalg::LinalgOp op) {
 LogicalResult
 DistributionAnalysis::visitGenericOp(linalg::GenericOp genericOp) {
   auto body = genericOp.getBody();
-
   auto &ops = body->getOperations();
-  if (ops.size() != 3) {
-    LLVM_DEBUG(llvm::dbgs() << "Generic op does not match expected pattern\n");
-    return success();
-  }
 
   // FIXME: this is a hack to identify linalg.generic ops that implement other
   // ops. Ideally, the analysis should work at a higher abstraction level,
@@ -218,12 +256,21 @@ DistributionAnalysis::visitGenericOp(linalg::GenericOp genericOp) {
   // FIXME: should we check which constant is used for clamping? For now, assume
   // it is 0.
   auto it = ops.begin();
-  if (llvm::isa<arith::CmpFOp>(*it) &&
+  if (ops.size() == 3 && llvm::isa<arith::CmpFOp>(*it) &&
       llvm::isa<arith::SelectOp>(*std::next(it))) {
+    // ReLU/Clamp pattern
     return visitClamp(genericOp, /* clampValue= */ 0.0);
   }
 
-  return success();
+  if (ops.size() == 2) {
+    if (auto divOp = llvm::dyn_cast<arith::DivFOp>(*it)) {
+      // Div op pattern
+      auto divisor = divOp.getRhs();
+      return visitDivFOp(genericOp, divisor);
+    }
+  }
+
+  return genericOp.emitError() << "Unsupported linalg.generic pattern";
 }
 
 /// Propagate distribution for a matrix multiplication-like operation, given the

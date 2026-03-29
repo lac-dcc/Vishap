@@ -42,6 +42,8 @@ private:
 
   LogicalResult visitClamp(linalg::GenericOp clamp, double clampValue);
 
+  LogicalResult visitDivFOp(linalg::GenericOp divOp, Value divisor);
+
   LogicalResult visitGenericOp(linalg::GenericOp genericOp);
 
   /// Propagate distribution for a generic unary linalg operation
