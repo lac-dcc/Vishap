@@ -59,6 +59,8 @@ private:
 
   LogicalResult visitConcat(tensor::ConcatOp concatOp);
 
+  LogicalResult visitCollapseShape(tensor::CollapseShapeOp collapseShapeOp);
+
   LogicalResult visitOperation(Operation *op);
 
   /// Get distributions for function args, if available.

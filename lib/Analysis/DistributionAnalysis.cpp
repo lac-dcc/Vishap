@@ -471,6 +471,22 @@ LogicalResult DistributionAnalysis::visitConcat(tensor::ConcatOp concatOp) {
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitCollapseShape(
+    tensor::CollapseShapeOp collapseShapeOp) {
+  auto input = collapseShapeOp.getSrc();
+  auto inputDistOrFailure = getDistribution(input);
+  if (failed(inputDistOrFailure)) {
+    return collapseShapeOp.emitError()
+           << "Missing distribution info for source.";
+  }
+
+  // FIXME: Assume tensor.collapse_shape is an identity. Does this always hold?
+  this->distributionMap[collapseShapeOp->getResult(0)] = *(*inputDistOrFailure);
+  this->analyzedOperations.insert(collapseShapeOp);
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
       .Case<arith::ConstantOp>(
@@ -498,6 +514,10 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       })
       .Case<tensor::ConcatOp>(
           [&](tensor::ConcatOp concatOp) { return visitConcat(concatOp); })
+      .Case<tensor::CollapseShapeOp>(
+          [&](tensor::CollapseShapeOp collapseShapeOp) {
+            return visitCollapseShape(collapseShapeOp);
+          })
       .Default([&](Operation *op) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities?
