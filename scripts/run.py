@@ -154,7 +154,6 @@ def _main():
 
     with Context() as ctx:
         module = _parse_network_to_llvm(ctx, args.input_model)
-        # module.operation.print(large_elements_limit=10)
         engine = ExecutionEngine(module, opt_level=3, shared_libs=MLIR_SHARED_LIBS)
 
     input_arrays = _create_io_arrays(args.input, is_input=True)
