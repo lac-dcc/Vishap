@@ -35,7 +35,7 @@ Distribution computeDistribution(DenseElementsAttr denseAttr) {
   }
   variance /= values.size();
 
-  LLVM_DEBUG(llvm::dbgs() << "Computed distribution: "
+  LLVM_DEBUG(llvm::dbgs() << "[computeDistribution] Computed distribution: "
                           << "min=" << min << ", max=" << max << ", mean="
                           << mean << ", variance=" << variance << "\n");
 
@@ -58,7 +58,8 @@ LogicalResult DistributionAnalysis::visitConstantOp(arith::ConstantOp constOp) {
   auto tensorType = llvm::dyn_cast<RankedTensorType>(type);
   if (!tensorType || !tensorType.getElementType().isFloat()) {
     // FIXME: For now, we only consider float tensors
-    LLVM_DEBUG(llvm::dbgs() << "Unsupported constant type: " << type << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "[visitConstantOp] Unsupported constant type: "
+                            << type << "\n");
     return success();
   }
 
@@ -408,15 +409,25 @@ LogicalResult DistributionAnalysis::visitPad(tensor::PadOp padOp) {
   double padValue =
       llvm::cast<FloatAttr>(constOp.getValue()).getValueAsDouble();
 
+  auto getTensorSize = [](llvm::ArrayRef<int64_t> shape) -> size_t {
+    size_t size = 1;
+    for (auto dim : shape) {
+      // FIXME: Dynamic shapes are being ignored, but this is not ideal. How
+      // should we handle this?
+      if (dim != ShapedType::kDynamic) {
+        size *= dim;
+      }
+    }
+
+    return size;
+  };
+
   // Compute size of source tensor
   auto sourceShape = source.getType().getShape();
-  size_t tensorSize = std::accumulate(sourceShape.begin(), sourceShape.end(), 1,
-                                      std::multiplies<size_t>());
-
+  size_t tensorSize = getTensorSize(sourceShape);
   // Compute size of padding
   auto outShape = padOp.getResult().getType().getShape();
-  size_t outSize = std::accumulate(outShape.begin(), outShape.end(), 1,
-                                   std::multiplies<size_t>());
+  size_t outSize = getTensorSize(outShape);
   size_t padSize = outSize - tensorSize;
 
   auto newSize = tensorSize + padSize;
@@ -568,8 +579,8 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       .Default([&](Operation *op) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities?
-        LLVM_DEBUG(llvm::dbgs()
-                   << "Unsupported operation: " << op->getName() << "\n");
+        LLVM_DEBUG(llvm::dbgs() << "[visitOperation] Unsupported operation: "
+                                << op->getName() << "\n");
         return success();
       });
 }

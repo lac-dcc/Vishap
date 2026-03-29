@@ -75,7 +75,7 @@ public:
     return analyzedOperations;
   }
 
-  FailureOr<const Distribution*> getDistribution(Value value);
+  FailureOr<const Distribution *> getDistribution(Value value);
 };
 
 } // namespace mlir::vishap
