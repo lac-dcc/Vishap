@@ -35,3 +35,21 @@ func.func @pad_one(%arg0: tensor<1x16x10x3xf32>) -> tensor<1x16x16x16xf32>
 // CHECK-NEXT:      vishap.distribution = [
 // CHECK-SAME:        [-1.000000e+00, 1.000000e+00, 0.947265625, 0.026808929443359369]
 // CHECK-SAME:      ]
+
+func.func @dynamic_shape(%arg0: tensor<?x2x3x4xf64>) -> tensor<?x4x4x4xf64>
+            attributes {vishap.args_distribution = [[0.75, 1.5, 1., 0.25]]} {
+  %cst = arith.constant 0.5 : f64
+  %padded = tensor.pad %arg0 low[0, 1, 1, 0] high[0, 1, 0, 0] {
+    ^bb0(%arg1: index, %arg2: index, %arg3: index, %arg4: index):
+    tensor.yield %cst : f64
+  } : tensor<?x2x3x4xf64> to tensor<?x4x4x4xf64>
+  return %padded : tensor<?x4x4x4xf64>
+}
+// CHECK-LABEL: func.func @dynamic_shape
+// CHECK-NEXT:    arith.constant
+// CHECK-NEXT:    tensor.pad
+// CHECK-NEXT:      ^bb0
+// CHECK-NEXT:        tensor.yield
+// CHECK-NEXT:      vishap.distribution = [
+// CHECK-SAME:        [5.000000e-01, 1.500000e+00, 6.875000e-01, 0.15234375]
+// CHECK-SAME:      ]

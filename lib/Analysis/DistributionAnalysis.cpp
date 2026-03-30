@@ -35,7 +35,7 @@ Distribution computeDistribution(DenseElementsAttr denseAttr) {
   }
   variance /= values.size();
 
-  LLVM_DEBUG(llvm::dbgs() << "Computed distribution: "
+  LLVM_DEBUG(llvm::dbgs() << "[computeDistribution] Computed distribution: "
                           << "min=" << min << ", max=" << max << ", mean="
                           << mean << ", variance=" << variance << "\n");
 
@@ -58,7 +58,8 @@ LogicalResult DistributionAnalysis::visitConstantOp(arith::ConstantOp constOp) {
   auto tensorType = llvm::dyn_cast<RankedTensorType>(type);
   if (!tensorType || !tensorType.getElementType().isFloat()) {
     // FIXME: For now, we only consider float tensors
-    LLVM_DEBUG(llvm::dbgs() << "Unsupported constant type: " << type << "\n");
+    LLVM_DEBUG(llvm::dbgs() << "[visitConstantOp] Unsupported constant type: "
+                            << type << "\n");
     return success();
   }
 
@@ -183,6 +184,49 @@ LogicalResult DistributionAnalysis::visitClamp(linalg::GenericOp clamp,
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitDivFOp(linalg::GenericOp divOp,
+                                                Value divisor) {
+  auto inputs = divOp.getInputs();
+  if (inputs.size() != 1) {
+    return divOp.emitError() << "Expected division op to have exactly 1 input";
+  }
+
+  auto outputs = divOp.getOutputs();
+  if (outputs.size() != 1) {
+    return divOp.emitError() << "Expected division op to have exactly 1 output";
+  }
+
+  auto inputDistOrFailure = getDistribution(inputs[0]);
+  if (failed(inputDistOrFailure)) {
+    return divOp.emitError() << "Missing distribution info for input.";
+  }
+
+  auto constOp = divisor.getDefiningOp<arith::ConstantOp>();
+  if (!constOp || !constOp.getType().isFloat()) {
+    return divOp.emitError()
+           << "Expected divisor to be defined by a scalar float constant op";
+  }
+
+  double divisorValue =
+      llvm::cast<FloatAttr>(constOp.getValue()).getValueAsDouble();
+  if (divisorValue == 0.0) {
+    return divOp.emitError()
+           << "Division by zero is not supported in distribution analysis";
+  }
+
+  const auto *inputDist = *inputDistOrFailure;
+  Distribution outputDist = {.min = inputDist->min / divisorValue,
+                             .max = inputDist->max / divisorValue,
+                             .mean = inputDist->mean / divisorValue,
+                             .variance = inputDist->variance /
+                                         (divisorValue * divisorValue)};
+
+  this->distributionMap[divOp.getResult(0)] = outputDist;
+  this->analyzedOperations.insert(divOp);
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitUnaryIdentityOp(linalg::LinalgOp op) {
   if (!op.isSingleInputOutput()) {
     return op.emitError() << "Expected unary operation with exactly "
@@ -203,12 +247,7 @@ LogicalResult DistributionAnalysis::visitUnaryIdentityOp(linalg::LinalgOp op) {
 LogicalResult
 DistributionAnalysis::visitGenericOp(linalg::GenericOp genericOp) {
   auto body = genericOp.getBody();
-
   auto &ops = body->getOperations();
-  if (ops.size() != 3) {
-    LLVM_DEBUG(llvm::dbgs() << "Generic op does not match expected pattern\n");
-    return success();
-  }
 
   // FIXME: this is a hack to identify linalg.generic ops that implement other
   // ops. Ideally, the analysis should work at a higher abstraction level,
@@ -218,12 +257,21 @@ DistributionAnalysis::visitGenericOp(linalg::GenericOp genericOp) {
   // FIXME: should we check which constant is used for clamping? For now, assume
   // it is 0.
   auto it = ops.begin();
-  if (llvm::isa<arith::CmpFOp>(*it) &&
+  if (ops.size() == 3 && llvm::isa<arith::CmpFOp>(*it) &&
       llvm::isa<arith::SelectOp>(*std::next(it))) {
+    // ReLU/Clamp pattern
     return visitClamp(genericOp, /* clampValue= */ 0.0);
   }
 
-  return success();
+  if (ops.size() == 2) {
+    if (auto divOp = llvm::dyn_cast<arith::DivFOp>(*it)) {
+      // Div op pattern
+      auto divisor = divOp.getRhs();
+      return visitDivFOp(genericOp, divisor);
+    }
+  }
+
+  return genericOp.emitError() << "Unsupported linalg.generic pattern";
 }
 
 /// Propagate distribution for a matrix multiplication-like operation, given the
@@ -361,15 +409,25 @@ LogicalResult DistributionAnalysis::visitPad(tensor::PadOp padOp) {
   double padValue =
       llvm::cast<FloatAttr>(constOp.getValue()).getValueAsDouble();
 
+  auto getTensorSize = [](llvm::ArrayRef<int64_t> shape) -> size_t {
+    size_t size = 1;
+    for (auto dim : shape) {
+      // FIXME: Dynamic shapes are being ignored, but this is not ideal. How
+      // should we handle this?
+      if (dim != ShapedType::kDynamic) {
+        size *= dim;
+      }
+    }
+
+    return size;
+  };
+
   // Compute size of source tensor
   auto sourceShape = source.getType().getShape();
-  size_t tensorSize = std::accumulate(sourceShape.begin(), sourceShape.end(), 1,
-                                      std::multiplies<size_t>());
-
+  size_t tensorSize = getTensorSize(sourceShape);
   // Compute size of padding
   auto outShape = padOp.getResult().getType().getShape();
-  size_t outSize = std::accumulate(outShape.begin(), outShape.end(), 1,
-                                   std::multiplies<size_t>());
+  size_t outSize = getTensorSize(outShape);
   size_t padSize = outSize - tensorSize;
 
   auto newSize = tensorSize + padSize;
@@ -471,6 +529,22 @@ LogicalResult DistributionAnalysis::visitConcat(tensor::ConcatOp concatOp) {
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitCollapseShape(
+    tensor::CollapseShapeOp collapseShapeOp) {
+  auto input = collapseShapeOp.getSrc();
+  auto inputDistOrFailure = getDistribution(input);
+  if (failed(inputDistOrFailure)) {
+    return collapseShapeOp.emitError()
+           << "Missing distribution info for source.";
+  }
+
+  // FIXME: Assume tensor.collapse_shape is an identity. Does this always hold?
+  this->distributionMap[collapseShapeOp->getResult(0)] = *(*inputDistOrFailure);
+  this->analyzedOperations.insert(collapseShapeOp);
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
       .Case<arith::ConstantOp>(
@@ -498,11 +572,15 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       })
       .Case<tensor::ConcatOp>(
           [&](tensor::ConcatOp concatOp) { return visitConcat(concatOp); })
+      .Case<tensor::CollapseShapeOp>(
+          [&](tensor::CollapseShapeOp collapseShapeOp) {
+            return visitCollapseShape(collapseShapeOp);
+          })
       .Default([&](Operation *op) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities?
-        LLVM_DEBUG(llvm::dbgs()
-                   << "Unsupported operation: " << op->getName() << "\n");
+        LLVM_DEBUG(llvm::dbgs() << "[visitOperation] Unsupported operation: "
+                                << op->getName() << "\n");
         return success();
       });
 }

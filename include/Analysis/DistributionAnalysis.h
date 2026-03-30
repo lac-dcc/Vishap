@@ -42,6 +42,8 @@ private:
 
   LogicalResult visitClamp(linalg::GenericOp clamp, double clampValue);
 
+  LogicalResult visitDivFOp(linalg::GenericOp divOp, Value divisor);
+
   LogicalResult visitGenericOp(linalg::GenericOp genericOp);
 
   /// Propagate distribution for a generic unary linalg operation
@@ -59,6 +61,8 @@ private:
 
   LogicalResult visitConcat(tensor::ConcatOp concatOp);
 
+  LogicalResult visitCollapseShape(tensor::CollapseShapeOp collapseShapeOp);
+
   LogicalResult visitOperation(Operation *op);
 
   /// Get distributions for function args, if available.
@@ -71,7 +75,7 @@ public:
     return analyzedOperations;
   }
 
-  FailureOr<const Distribution*> getDistribution(Value value);
+  FailureOr<const Distribution *> getDistribution(Value value);
 };
 
 } // namespace mlir::vishap
