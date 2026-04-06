@@ -480,6 +480,31 @@ DistributionAnalysis::visitSumPooling(linalg::PoolingNchwSumOp poolingOp) {
   return success();
 }
 
+LogicalResult
+DistributionAnalysis::visitMaxPooling(linalg::PoolingNchwMaxOp poolingOp) {
+  auto inputs = poolingOp.getInputs();
+  assert(inputs.size() == 2 &&
+         "Expected linalg.pooling_nchw_max to have exactly 2 inputs");
+
+  auto input = inputs[0];
+  auto inputDistOrFailure = getDistribution(input);
+  if (failed(inputDistOrFailure)) {
+    return poolingOp.emitError() << "Missing distribution info for input.";
+  }
+
+  const auto *inputDist = *inputDistOrFailure;
+  Distribution outputDist = {.min = inputDist->min,
+                             .max = inputDist->max,
+                             // FIMXE: This estimation can be improved
+                             .mean = inputDist->mean + inputDist->variance,
+                             .variance = inputDist->variance};
+
+  this->distributionMap[poolingOp->getResult(0)] = outputDist;
+  this->analyzedOperations.insert(poolingOp);
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitConcat(tensor::ConcatOp concatOp) {
   auto axis = concatOp.getDim();
 
@@ -569,6 +594,9 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       .Case<tensor::PadOp>([&](tensor::PadOp padOp) { return visitPad(padOp); })
       .Case<linalg::PoolingNchwSumOp>([&](linalg::PoolingNchwSumOp poolingOp) {
         return visitSumPooling(poolingOp);
+      })
+      .Case<linalg::PoolingNchwMaxOp>([&](linalg::PoolingNchwMaxOp poolingOp) {
+        return visitMaxPooling(poolingOp);
       })
       .Case<tensor::ConcatOp>(
           [&](tensor::ConcatOp concatOp) { return visitConcat(concatOp); })
