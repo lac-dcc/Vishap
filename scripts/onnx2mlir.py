@@ -96,6 +96,7 @@ def convert_onnx_to_mlir(
         passes = [
             "torch-onnx-to-torch-backend-pipeline",
             "torch-backend-to-linalg-on-tensors-backend-pipeline",
+            "linalg-specialize-generic-ops"
         ]
         try:
             imp = onnx_importer.NodeImporter.define_function(model_info.main_graph, m)
