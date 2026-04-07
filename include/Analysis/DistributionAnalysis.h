@@ -59,6 +59,8 @@ private:
 
   LogicalResult visitSumPooling(linalg::PoolingNchwSumOp poolingOp);
 
+  LogicalResult visitMaxPooling(linalg::PoolingNchwMaxOp poolingOp);
+
   LogicalResult visitConcat(tensor::ConcatOp concatOp);
 
   LogicalResult visitCollapseShape(tensor::CollapseShapeOp collapseShapeOp);
