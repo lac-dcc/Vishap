@@ -409,6 +409,14 @@ LogicalResult DistributionAnalysis::visitPad(tensor::PadOp padOp) {
   double padValue =
       llvm::cast<FloatAttr>(constOp.getValue()).getValueAsDouble();
 
+  if (std::isnan(padValue) || std::isinf(padValue)) {
+    padOp->emitWarning() << "Pad value is NaN/Inf. Treating pad as identity "
+                            "for distribution analysis.";
+    this->distributionMap[padOp.getResult()] = (*sourceDist);
+    this->analyzedOperations.insert(padOp);
+    return success();
+  }
+
   auto getTensorSize = [](llvm::ArrayRef<int64_t> shape) -> size_t {
     size_t size = 1;
     for (auto dim : shape) {
