@@ -66,7 +66,6 @@ LogicalResult DistributionAnalysis::visitConstantOp(arith::ConstantOp constOp) {
   // Extract the constant value and update the distribution map
   auto valueAttr = constOp.getValue();
   if (auto denseAttr = llvm::dyn_cast<DenseElementsAttr>(valueAttr)) {
-    Distribution distribution;
     switch (tensorType.getElementType().getIntOrFloatBitWidth()) {
     case 32: {
       this->distributionMap[constOp.getResult()] =

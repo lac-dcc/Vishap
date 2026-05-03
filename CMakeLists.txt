@@ -27,7 +27,9 @@ include(AddMLIR)
 
 include_directories(
   ${PROJECT_SOURCE_DIR}/include
+  ${PROJECT_SOURCE_DIR}/external/mlir-probe/include
   ${CMAKE_BINARY_DIR}/include
+  ${CMAKE_BINARY_DIR}/external/mlir-probe/include
   ${LLVM_INCLUDE_DIRS}
   ${MLIR_INCLUDE_DIRS}
 )
@@ -37,10 +39,13 @@ add_definitions(${LLVM_DEFINITIONS})
 # Project configuration
 # ------------------------------------------------------------------------------
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+add_compile_options(-Wall)
 
 # ------------------------------------------------------------------------------
 # Subdirectories
 # ------------------------------------------------------------------------------
+
+add_subdirectory(external/mlir-probe)
 
 add_subdirectory(lib)
 add_subdirectory(tools)

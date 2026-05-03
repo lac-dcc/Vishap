@@ -1,5 +1,5 @@
-#ifndef VISHAP_TRANSFORMS_PASSES
-#define VISHAP_TRANSFORMS_PASSES
+#ifndef VISHAP_TRANSFORMS_PASSES_TD
+#define VISHAP_TRANSFORMS_PASSES_TD
 
 include "mlir/Pass/PassBase.td"
 
@@ -17,4 +17,10 @@ def AnnotateDistributionsPass
   ];
 }
 
-#endif // VISHAP_TRANSFORMS_PASSES
+def AddProbeCallsPass
+    : Pass<"add-probe-calls", "mlir::func::FuncOp"> {
+  let summary = "Add calls for observing tensor values at runtime";
+  let dependentDialects = ["probe::ProbeDialect"];
+}
+
+#endif // VISHAP_TRANSFORMS_PASSES_TD
