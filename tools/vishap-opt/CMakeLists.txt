@@ -10,6 +10,8 @@ get_property(conversion_libs GLOBAL PROPERTY MLIR_CONVERSION_LIBS)
 target_link_libraries(vishap-opt
   PRIVATE
   VishapTransforms
+  MLIRProbeDialect
+  MLIRProbeTransforms
 
   # MLIR dependencies
   MLIROptLib

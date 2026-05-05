@@ -1,6 +1,7 @@
 .venv
 .vscode
 .cache
+.clangd
 build/
 tmp/
 /models/

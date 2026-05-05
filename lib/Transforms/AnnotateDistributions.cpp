@@ -66,7 +66,7 @@ public:
 
   void runOnOperation() override {
     auto func = getOperation();
-    auto ctx = &getContext();
+    auto *ctx = &getContext();
     Builder builder(ctx);
 
     if (failed(parseInputDists(func, builder))) {
