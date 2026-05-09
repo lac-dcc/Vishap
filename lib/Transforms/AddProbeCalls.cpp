@@ -45,6 +45,19 @@ public:
                                          static_cast<uint32_t>(resultID));
       }
     }
+
+    if (worklist.empty()) {
+      // No need to report if no probe.observe ops were added
+      return;
+    }
+
+    worklist.clear();
+    // Insert probe.report before all returns
+    funcOp.walk([&](func::ReturnOp returnOp) { worklist.push_back(returnOp); });
+    for (auto returnOp : worklist) {
+      builder.setInsertionPoint(returnOp);
+      builder.create<probe::ReportOp>(returnOp->getLoc());
+    }
   }
 };
 } // namespace
