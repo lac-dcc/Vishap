@@ -19,8 +19,9 @@ Distribution computeDistribution(DenseElementsAttr denseAttr) {
   double sum = 0.0;
   auto values = denseAttr.getValues<T>();
   for (auto element : values) {
-    max = max > element ? max : static_cast<double>(element);
-    min = min < element ? min : static_cast<double>(element);
+    double elementDouble = static_cast<double>(element);
+    max = max > elementDouble ? max : elementDouble;
+    min = min < elementDouble ? min : elementDouble;
     // FIXME: this could overflow for large values
     sum += element;
   }
@@ -408,7 +409,7 @@ LogicalResult DistributionAnalysis::visitPad(tensor::PadOp padOp) {
   double padValue =
       llvm::cast<FloatAttr>(constOp.getValue()).getValueAsDouble();
 
-  if (std::isnan(padValue) || std::isinf(padValue)) {
+  if (!std::isfinite(padValue)) {
     padOp->emitWarning() << "Pad value is NaN/Inf. Treating pad as identity "
                             "for distribution analysis.";
     this->distributionMap[padOp.getResult()] = (*sourceDist);

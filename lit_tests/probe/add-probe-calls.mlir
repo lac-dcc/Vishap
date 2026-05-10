@@ -28,6 +28,7 @@ func.func @with_dist_info(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>, %arg2:
 // CHECK-NEXT:    tensor.empty
 // CHECK-NEXT:    %[[MATMUL_RES:.*]] = linalg.matmul
 // CHECK-NEXT:    probe.observe(%[[MATMUL_RES]] : tensor<2x2xf32>) {opID = 1 : i32, resultID = 0 : i32}
+// CHECK-NEXT:    probe.report
 // CHECK-NEXT:    return
 
 func.func @mixed(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>, %arg2: tensor<2x2xf32>) -> tensor<2x2xf32> {
@@ -43,4 +44,5 @@ func.func @mixed(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>, %arg2: tensor<2
 // CHECK-NEXT:    tensor.empty
 // CHECK-NEXT:    %[[ADD_RES:.*]] = linalg.add
 // CHECK-NEXT:    probe.observe(%[[ADD_RES]] : tensor<2x2xf32>) {opID = 0 : i32, resultID = 0 : i32}
+// CHECK-NEXT:    probe.report
 // CHECK-NEXT:    return
