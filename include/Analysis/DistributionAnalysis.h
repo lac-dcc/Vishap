@@ -1,13 +1,13 @@
 #ifndef VISHAP_INCLUDE_ANALYSIS_DISTRIBUTIONANALYSIS_H
 #define VISHAP_INCLUDE_ANALYSIS_DISTRIBUTIONANALYSIS_H
 
+#include "Support/Distribution.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Value.h"
-#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include <array>
 
@@ -17,13 +17,6 @@ namespace mlir::vishap {
 constexpr char kArgsDistributionAttrName[] = "vishap.args_distribution";
 /// Attribute name for operations results distribution info.
 constexpr char kDistributionAttrName[] = "vishap.distribution";
-
-struct Distribution {
-  double min;
-  double max;
-  double mean;
-  double variance;
-};
 
 std::array<Attribute, 4>
 distributionToArrayAttr(Builder &builder, const Distribution &distribution);

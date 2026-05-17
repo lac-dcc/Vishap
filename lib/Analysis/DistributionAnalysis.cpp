@@ -1,4 +1,5 @@
 #include "Analysis/DistributionAnalysis.h"
+#include "Support/Distribution.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -11,37 +12,6 @@
 namespace mlir::vishap {
 namespace {
 #define DEBUG_TYPE "vishap-analysis"
-
-template <typename T>
-Distribution computeDistribution(DenseElementsAttr denseAttr) {
-  double max = std::numeric_limits<double>::lowest();
-  double min = std::numeric_limits<double>::infinity();
-  double sum = 0.0;
-  auto values = denseAttr.getValues<T>();
-  for (auto element : values) {
-    double elementDouble = static_cast<double>(element);
-    max = max > elementDouble ? max : elementDouble;
-    min = min < elementDouble ? min : elementDouble;
-    // FIXME: this could overflow for large values
-    sum += element;
-  }
-
-  double mean = sum / values.size();
-  double variance = 0.0;
-  // FIXME: should we traverse the whole constant, or only take a sample?
-  // For large constants, this could be expensive.
-  for (auto element : values) {
-    double elementDouble = static_cast<double>(element);
-    variance += (elementDouble - mean) * (elementDouble - mean);
-  }
-  variance /= values.size();
-
-  LLVM_DEBUG(llvm::dbgs() << "[computeDistribution] Computed distribution: "
-                          << "min=" << min << ", max=" << max << ", mean="
-                          << mean << ", variance=" << variance << "\n");
-
-  return {min, max, mean, variance};
-}
 } // namespace
 
 /// Convert \p distribution to an array attribute that can be attached to an
@@ -64,18 +34,23 @@ LogicalResult DistributionAnalysis::visitConstantOp(arith::ConstantOp constOp) {
     return success();
   }
 
+  // FIXME: should we traverse the whole constant, or only take a sample?
+  // For large constants, this could be expensive.
+
   // Extract the constant value and update the distribution map
   auto valueAttr = constOp.getValue();
   if (auto denseAttr = llvm::dyn_cast<DenseElementsAttr>(valueAttr)) {
     switch (tensorType.getElementType().getIntOrFloatBitWidth()) {
     case 32: {
+      auto values = denseAttr.getValues<float>();
       this->distributionMap[constOp.getResult()] =
-          computeDistribution<float>(denseAttr);
+          computeFloatRangeDistribution<float, decltype(values)>(values);
       break;
     }
     case 64: {
+      auto values = denseAttr.getValues<double>();
       this->distributionMap[constOp.getResult()] =
-          computeDistribution<double>(denseAttr);
+          computeFloatRangeDistribution<double, decltype(values)>(values);
       break;
     }
     default:
