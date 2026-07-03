@@ -4,7 +4,5 @@ numpy==2.2.6
 onnx==1.20.1
 onnxruntime==1.23.2
 -f https://github.com/llvm/torch-mlir-release/releases/expanded_assets/dev-wheels
-torch-mlir
--f https://download.pytorch.org/whl/nightly/cpu/torch/
---pre
-torch==2.11.0.dev20251222
+torch-mlir==20260411.779
+torch==2.11.0
