@@ -1,3 +1,6 @@
 [submodule "external/mlir-probe"]
 	path = external/mlir-probe
 	url = https://github.com/lac-dcc/mlir-probe
+[submodule "external/stablehlo"]
+	path = external/stablehlo
+	url = https://github.com/openxla/stablehlo

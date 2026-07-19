@@ -16,10 +16,7 @@ public:
   using Base::Base;
 
   void runOnOperation() override {
-    auto funcOp = dyn_cast<func::FuncOp>(getOperation());
-    if (!funcOp)
-      return;
-
+    auto funcOp = getOperation();
     std::vector<Operation *> worklist;
     funcOp.walk([&](Operation *op) {
       // Only consider ops with vishap distribution attribute
@@ -40,9 +37,9 @@ public:
         builder.setInsertionPointAfter(op);
 
         auto loc = op->getLoc();
-        builder.create<probe::ObserveOp>(loc, result,
-                                         static_cast<uint32_t>(opID),
-                                         static_cast<uint32_t>(resultID));
+        probe::ObserveOp::create(builder, loc, result,
+                                 static_cast<uint32_t>(opID),
+                                 static_cast<uint32_t>(resultID));
       }
     }
 
@@ -56,7 +53,7 @@ public:
     funcOp.walk([&](func::ReturnOp returnOp) { worklist.push_back(returnOp); });
     for (auto returnOp : worklist) {
       builder.setInsertionPoint(returnOp);
-      builder.create<probe::ReportOp>(returnOp->getLoc());
+      probe::ReportOp::create(builder, returnOp->getLoc());
     }
   }
 };
