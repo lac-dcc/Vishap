@@ -14,7 +14,7 @@ target_link_libraries(vishap-opt
   MLIRProbeTransforms
 
   # MLIR dependencies
-  MLIROptLib
+  MLIRMlirOptMain
   ${dialect_libs}
   ${conversion_libs}
 )
