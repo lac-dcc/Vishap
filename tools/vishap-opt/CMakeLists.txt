@@ -13,6 +13,13 @@ target_link_libraries(vishap-opt
   MLIRProbeDialect
   MLIRProbeTransforms
 
+  # StableHLO dependencies
+  StablehloRegister
+  StablehloOps
+  StablehloPasses
+  StablehloOptimizationPasses
+  StablehloLinalgTransforms
+
   # MLIR dependencies
   MLIRMlirOptMain
   ${dialect_libs}

@@ -2,12 +2,9 @@
 #define VISHAP_INCLUDE_ANALYSIS_DISTRIBUTIONANALYSIS_H
 
 #include "Support/Distribution.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Linalg/IR/LinalgInterfaces.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/Value.h"
+#include "stablehlo/dialect/StablehloOps.h"
 #include "llvm/ADT/DenseSet.h"
 #include <array>
 
@@ -29,34 +26,40 @@ private:
 
   llvm::DenseMap<Value, Distribution> distributionMap;
 
-  LogicalResult visitConstantOp(arith::ConstantOp constOp);
+  /// Compute the empirical distribution of a constant-like operation whose
+  /// value is given by \p valueAttr.
+  LogicalResult visitConstantLikeOp(Operation *op, Attribute valueAttr);
 
-  LogicalResult visitAddOp(linalg::AddOp addOp);
+  LogicalResult visitAddOp(stablehlo::AddOp addOp);
 
-  LogicalResult visitClamp(linalg::GenericOp clamp, double clampValue);
+  /// Propagate distribution for a value that is clamped from below at
+  /// \p clampValue (e.g. ReLU when \p clampValue is 0).
+  LogicalResult visitClamp(Operation *op, Value input, double clampValue);
 
-  LogicalResult visitDivFOp(linalg::GenericOp divOp, Value divisor);
+  LogicalResult visitMaxOp(stablehlo::MaxOp maxOp);
 
-  LogicalResult visitGenericOp(linalg::GenericOp genericOp);
+  LogicalResult visitDivOp(stablehlo::DivOp divOp);
 
-  /// Propagate distribution for a generic unary linalg operation
-  LogicalResult visitUnaryIdentityOp(linalg::LinalgOp op);
+  /// Propagate distribution for a unary operation that does not change the
+  /// distribution of its input (e.g. transpose, reshape, broadcast).
+  LogicalResult visitUnaryIdentityOp(Operation *op);
 
-  LogicalResult visitMatmul(linalg::MatmulOp matmulOp);
+  LogicalResult visitDotGeneral(stablehlo::DotGeneralOp dotOp);
 
-  LogicalResult visitConv2D(linalg::Conv2DNchwFchwOp convOp);
+  LogicalResult visitConvolution(stablehlo::ConvolutionOp convOp);
 
-  LogicalResult visitFill(linalg::FillOp fillOp);
+  /// Shared transfer function for reductions (reduce / reduce_window) that
+  /// fold \p reduceSize elements of \p input with a single Add or Max body.
+  LogicalResult visitReductionLike(Operation *op, Value input, Region &body,
+                                   int64_t reduceSize);
 
-  LogicalResult visitPad(tensor::PadOp padOp);
+  LogicalResult visitReduceWindow(stablehlo::ReduceWindowOp reduceWindowOp);
 
-  LogicalResult visitSumPooling(linalg::PoolingNchwSumOp poolingOp);
+  LogicalResult visitReduce(stablehlo::ReduceOp reduceOp);
 
-  LogicalResult visitMaxPooling(linalg::PoolingNchwMaxOp poolingOp);
+  LogicalResult visitPad(stablehlo::PadOp padOp);
 
-  LogicalResult visitConcat(tensor::ConcatOp concatOp);
-
-  LogicalResult visitCollapseShape(tensor::CollapseShapeOp collapseShapeOp);
+  LogicalResult visitConcatenate(stablehlo::ConcatenateOp concatOp);
 
   LogicalResult visitOperation(Operation *op);
 

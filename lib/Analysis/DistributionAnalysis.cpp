@@ -1,7 +1,9 @@
 #include "Analysis/DistributionAnalysis.h"
 #include "Support/Distribution.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
@@ -12,6 +14,41 @@
 namespace mlir::vishap {
 namespace {
 #define DEBUG_TYPE "vishap-analysis"
+
+/// Try to extract the value of a scalar or splat float constant that defines
+/// \p value, looking through shape-preserving ops (broadcast, reshape).
+FailureOr<double> getScalarConstantValue(Value value) {
+  Operation *def = value.getDefiningOp();
+  while (def &&
+         llvm::isa<stablehlo::BroadcastInDimOp, stablehlo::ReshapeOp>(def)) {
+    def = def->getOperand(0).getDefiningOp();
+  }
+
+  if (!def) {
+    return failure();
+  }
+
+  Attribute valueAttr;
+  if (auto stablehloConst = llvm::dyn_cast<stablehlo::ConstantOp>(def)) {
+    valueAttr = stablehloConst.getValue();
+  } else if (auto arithConst = llvm::dyn_cast<arith::ConstantOp>(def)) {
+    valueAttr = arithConst.getValue();
+  } else {
+    return failure();
+  }
+
+  if (auto floatAttr = llvm::dyn_cast<FloatAttr>(valueAttr)) {
+    return floatAttr.getValueAsDouble();
+  }
+
+  auto denseAttr = llvm::dyn_cast<DenseElementsAttr>(valueAttr);
+  if (!denseAttr || !denseAttr.isSplat() ||
+      !llvm::isa<FloatType>(denseAttr.getElementType())) {
+    return failure();
+  }
+
+  return denseAttr.getSplatValue<APFloat>().convertToDouble();
+}
 } // namespace
 
 /// Convert \p distribution to an array attribute that can be attached to an
@@ -24,13 +61,18 @@ distributionToArrayAttr(Builder &builder, const Distribution &distribution) {
           builder.getF64FloatAttr(distribution.variance)};
 }
 
-LogicalResult DistributionAnalysis::visitConstantOp(arith::ConstantOp constOp) {
-  auto type = constOp.getType();
+LogicalResult DistributionAnalysis::visitConstantLikeOp(Operation *op,
+                                                        Attribute valueAttr) {
+  assert(op->getNumResults() == 1 &&
+         "Constant-like operation should have exactly one result");
+
+  auto type = op->getResult(0).getType();
   auto tensorType = llvm::dyn_cast<RankedTensorType>(type);
   if (!tensorType || !tensorType.getElementType().isFloat()) {
     // FIXME: For now, we only consider float tensors
-    LLVM_DEBUG(llvm::dbgs() << "[visitConstantOp] Unsupported constant type: "
-                            << type << "\n");
+    LLVM_DEBUG(llvm::dbgs()
+               << "[visitConstantLikeOp] Unsupported constant type: " << type
+               << "\n");
     return success();
   }
 
@@ -38,38 +80,34 @@ LogicalResult DistributionAnalysis::visitConstantOp(arith::ConstantOp constOp) {
   // For large constants, this could be expensive.
 
   // Extract the constant value and update the distribution map
-  auto valueAttr = constOp.getValue();
   if (auto denseAttr = llvm::dyn_cast<DenseElementsAttr>(valueAttr)) {
     switch (tensorType.getElementType().getIntOrFloatBitWidth()) {
     case 32: {
       auto values = denseAttr.getValues<float>();
-      this->distributionMap[constOp.getResult()] =
+      this->distributionMap[op->getResult(0)] =
           computeFloatRangeDistribution<float, decltype(values)>(values);
       break;
     }
     case 64: {
       auto values = denseAttr.getValues<double>();
-      this->distributionMap[constOp.getResult()] =
+      this->distributionMap[op->getResult(0)] =
           computeFloatRangeDistribution<double, decltype(values)>(values);
       break;
     }
     default:
-      return constOp.emitError()
+      return op->emitError()
              << "Unsupported element type for distribution analysis: "
              << tensorType.getElementType();
     }
   }
 
-  this->analyzedOperations.insert(constOp);
+  this->analyzedOperations.insert(op);
   return success();
 }
 
-LogicalResult DistributionAnalysis::visitAddOp(linalg::AddOp addOp) {
-  auto inputs = addOp.getInputs();
-  assert(inputs.size() == 2 && "Expected linalg.add to have exactly 2 inputs");
-
-  auto lhsDistOrFailure = getDistribution(inputs[0]);
-  auto rhsDistOrFailure = getDistribution(inputs[1]);
+LogicalResult DistributionAnalysis::visitAddOp(stablehlo::AddOp addOp) {
+  auto lhsDistOrFailure = getDistribution(addOp.getLhs());
+  auto rhsDistOrFailure = getDistribution(addOp.getRhs());
   if (failed(lhsDistOrFailure) || failed(rhsDistOrFailure)) {
     // If we don't have distribution info for one of the inputs, we can't
     // compute the distribution for the output.
@@ -87,31 +125,17 @@ LogicalResult DistributionAnalysis::visitAddOp(linalg::AddOp addOp) {
   outputDist.mean = lhsDist->mean + rhsDist->mean;
   outputDist.variance = lhsDist->variance + rhsDist->variance;
 
-  // Sanity check
-  assert(addOp->getNumResults() == 1 &&
-         "Expected linalg.add to have exactly one result");
-
-  this->distributionMap[addOp.getResult(0)] = outputDist;
+  this->distributionMap[addOp.getResult()] = outputDist;
   this->analyzedOperations.insert(addOp);
 
   return success();
 }
 
-LogicalResult DistributionAnalysis::visitClamp(linalg::GenericOp clamp,
+LogicalResult DistributionAnalysis::visitClamp(Operation *op, Value input,
                                                double clampValue) {
-  auto inputs = clamp.getInputs();
-  if (inputs.size() != 1) {
-    return clamp.emitError() << "Expected clamp to have exactly 1 input";
-  }
-
-  auto outputs = clamp.getOutputs();
-  if (outputs.size() != 1) {
-    return clamp.emitError() << "Expected clamp to have exactly 1 output";
-  }
-
-  auto inputDistOrFailure = getDistribution(inputs[0]);
+  auto inputDistOrFailure = getDistribution(input);
   if (failed(inputDistOrFailure)) {
-    return clamp.emitError() << "Missing distribution info for input.";
+    return op->emitError() << "Missing distribution info for input.";
   }
 
   const auto *inputDist = *inputDistOrFailure;
@@ -153,100 +177,90 @@ LogicalResult DistributionAnalysis::visitClamp(linalg::GenericOp clamp,
                              .mean = rectifiedMean,
                              .variance = rectifiedVariance};
 
-  this->distributionMap[clamp.getResult(0)] = outputDist;
-  this->analyzedOperations.insert(clamp);
+  this->distributionMap[op->getResult(0)] = outputDist;
+  this->analyzedOperations.insert(op);
 
   return success();
 }
 
-LogicalResult DistributionAnalysis::visitDivFOp(linalg::GenericOp divOp,
-                                                Value divisor) {
-  auto inputs = divOp.getInputs();
-  if (inputs.size() != 1) {
-    return divOp.emitError() << "Expected division op to have exactly 1 input";
+LogicalResult DistributionAnalysis::visitMaxOp(stablehlo::MaxOp maxOp) {
+  // A maximum against a constant is a clamp from below (e.g. ReLU when the
+  // constant is 0).
+  auto lhsConstOrFailure = getScalarConstantValue(maxOp.getLhs());
+  auto rhsConstOrFailure = getScalarConstantValue(maxOp.getRhs());
+
+  if (succeeded(rhsConstOrFailure)) {
+    return visitClamp(maxOp, maxOp.getLhs(), *rhsConstOrFailure);
   }
 
-  auto outputs = divOp.getOutputs();
-  if (outputs.size() != 1) {
-    return divOp.emitError() << "Expected division op to have exactly 1 output";
+  if (succeeded(lhsConstOrFailure)) {
+    return visitClamp(maxOp, maxOp.getRhs(), *lhsConstOrFailure);
   }
 
-  auto inputDistOrFailure = getDistribution(inputs[0]);
-  if (failed(inputDistOrFailure)) {
-    return divOp.emitError() << "Missing distribution info for input.";
-  }
+  return maxOp.emitError()
+         << "Expected one of the operands of stablehlo.maximum to be a "
+            "scalar or splat float constant";
+}
 
-  auto constOp = divisor.getDefiningOp<arith::ConstantOp>();
-  if (!constOp || !constOp.getType().isFloat()) {
+LogicalResult DistributionAnalysis::visitDivOp(stablehlo::DivOp divOp) {
+  auto lhsDistOrFailure = getDistribution(divOp.getLhs());
+  auto rhsDistOrFailure = getDistribution(divOp.getRhs());
+  if (failed(lhsDistOrFailure) || failed(rhsDistOrFailure)) {
     return divOp.emitError()
-           << "Expected divisor to be defined by a scalar float constant op";
+           << "Missing distribution info for at least one of the inputs.";
   }
 
-  double divisorValue =
-      llvm::cast<FloatAttr>(constOp.getValue()).getValueAsDouble();
-  if (divisorValue == 0.0) {
+  const auto *lhsDist = *lhsDistOrFailure;
+  const auto *rhsDist = *rhsDistOrFailure;
+
+  // FIXME: this may be too restrictive
+  // The divisor support must not contain zero, otherwise the ratio range is
+  // unbounded / undefined.
+  if (rhsDist->min <= 0.0 && rhsDist->max >= 0.0) {
     return divOp.emitError()
-           << "Division by zero is not supported in distribution analysis";
+           << "Division by a value whose range contains zero is not "
+              "supported in distribution analysis";
   }
 
-  const auto *inputDist = *inputDistOrFailure;
-  Distribution outputDist = {.min = inputDist->min / divisorValue,
-                             .max = inputDist->max / divisorValue,
-                             .mean = inputDist->mean / divisorValue,
-                             .variance = inputDist->variance /
-                                         (divisorValue * divisorValue)};
+  // Mean/variance assume independent operands (same premise as Add). When the
+  // divisor is degenerate these reduce to exact scaling by a constant.
+  // Min/max are the range of the ratio over the product of the input intervals
+  // (extrema at the corners when the divisor has constant sign).
+  double muY = rhsDist->mean;
+  double muYSq = muY * muY;
+  Distribution outputDist;
+  outputDist.mean = lhsDist->mean / muY;
+  outputDist.variance =
+      lhsDist->variance / muYSq +
+      (lhsDist->mean * lhsDist->mean) * rhsDist->variance / (muYSq * muYSq);
 
-  this->distributionMap[divOp.getResult(0)] = outputDist;
+  double c00 = lhsDist->min / rhsDist->min;
+  double c01 = lhsDist->min / rhsDist->max;
+  double c10 = lhsDist->max / rhsDist->min;
+  double c11 = lhsDist->max / rhsDist->max;
+  outputDist.min = std::min(std::min(c00, c01), std::min(c10, c11));
+  outputDist.max = std::max(std::max(c00, c01), std::max(c10, c11));
+
+  this->distributionMap[divOp.getResult()] = outputDist;
   this->analyzedOperations.insert(divOp);
 
   return success();
 }
 
-LogicalResult DistributionAnalysis::visitUnaryIdentityOp(linalg::LinalgOp op) {
-  if (!op.isSingleInputOutput()) {
-    return op.emitError() << "Expected unary operation with exactly "
-                             "one input and one output";
-  }
+LogicalResult DistributionAnalysis::visitUnaryIdentityOp(Operation *op) {
+  assert(op->getNumOperands() >= 1 && op->getNumResults() == 1 &&
+         "Expected unary operation with at least one operand and exactly one "
+         "result");
 
   auto inputDistOrFailure = getDistribution(op->getOperand(0));
   if (failed(inputDistOrFailure)) {
-    return op.emitError() << "Missing distribution info for input.";
+    return op->emitError() << "Missing distribution info for input.";
   }
 
   this->distributionMap[op->getResult(0)] = *(*inputDistOrFailure);
   this->analyzedOperations.insert(op);
 
   return success();
-}
-
-LogicalResult
-DistributionAnalysis::visitGenericOp(linalg::GenericOp genericOp) {
-  auto body = genericOp.getBody();
-  auto &ops = body->getOperations();
-
-  // FIXME: this is a hack to identify linalg.generic ops that implement other
-  // ops. Ideally, the analysis should work at a higher abstraction level,
-  // where it would be trivial to identify computational graph operations, but
-  // this is not the case with linalg.
-
-  // FIXME: should we check which constant is used for clamping? For now, assume
-  // it is 0.
-  auto it = ops.begin();
-  if (ops.size() == 3 && llvm::isa<arith::CmpFOp>(*it) &&
-      llvm::isa<arith::SelectOp>(*std::next(it))) {
-    // ReLU/Clamp pattern
-    return visitClamp(genericOp, /* clampValue= */ 0.0);
-  }
-
-  if (ops.size() == 2) {
-    if (auto divOp = llvm::dyn_cast<arith::DivFOp>(*it)) {
-      // Div op pattern
-      auto divisor = divOp.getRhs();
-      return visitDivFOp(genericOp, divisor);
-    }
-  }
-
-  return genericOp.emitError() << "Unsupported linalg.generic pattern";
 }
 
 /// Propagate distribution for a matrix multiplication-like operation, given the
@@ -276,42 +290,46 @@ Distribution getMatrixMultiplicationDistribution(long contractionSize,
   return outputDist;
 }
 
-LogicalResult DistributionAnalysis::visitMatmul(linalg::MatmulOp matmulOp) {
-  auto inputs = matmulOp.getInputs();
-  assert(inputs.size() == 2 &&
-         "Expected linalg.matmul to have exactly 2 inputs");
-
-  auto lhsDistOrFailure = getDistribution(inputs[0]);
-  auto rhsDistOrFailure = getDistribution(inputs[1]);
+LogicalResult
+DistributionAnalysis::visitDotGeneral(stablehlo::DotGeneralOp dotOp) {
+  auto lhsDistOrFailure = getDistribution(dotOp.getLhs());
+  auto rhsDistOrFailure = getDistribution(dotOp.getRhs());
   if (failed(lhsDistOrFailure) || failed(rhsDistOrFailure)) {
     // If we don't have distribution info for one of the inputs, we can't
     // compute the distribution for the output.
-    return matmulOp.emitError()
+    return dotOp.emitError()
            << "Missing distribution info for at least one of the inputs.";
   }
 
   const auto *lhsDist = *lhsDistOrFailure;
   const auto *rhsDist = *rhsDistOrFailure;
-  auto innerDim =
-      llvm::cast<ShapedType>(inputs[1].getType()).getShape().front();
+
+  // The contraction size is the number of elements that are multiplied and
+  // accumulated for each element of the output.
+  auto lhsShape = llvm::cast<ShapedType>(dotOp.getLhs().getType()).getShape();
+  auto dimNumbers = dotOp.getDotDimensionNumbers();
+  int64_t contractionSize = 1;
+  for (auto dim : dimNumbers.getLhsContractingDimensions()) {
+    if (lhsShape[dim] == ShapedType::kDynamic) {
+      return dotOp.emitError()
+             << "Dynamic contracting dimensions are not supported";
+    }
+    contractionSize *= lhsShape[dim];
+  }
 
   Distribution outputDist =
-      getMatrixMultiplicationDistribution(innerDim, lhsDist, rhsDist);
+      getMatrixMultiplicationDistribution(contractionSize, lhsDist, rhsDist);
 
-  this->distributionMap[matmulOp.getResult(0)] = outputDist;
-  this->analyzedOperations.insert(matmulOp);
+  this->distributionMap[dotOp.getResult()] = outputDist;
+  this->analyzedOperations.insert(dotOp);
 
   return success();
 }
 
 LogicalResult
-DistributionAnalysis::visitConv2D(linalg::Conv2DNchwFchwOp convOp) {
-  auto inputs = convOp.getInputs();
-  assert(inputs.size() == 2 &&
-         "Expected linalg.conv_2d_nchw_fchw to have exactly 2 inputs");
-
-  auto inputDistOrFailure = getDistribution(inputs[0]);
-  auto kernelDistOrFailure = getDistribution(inputs[1]);
+DistributionAnalysis::visitConvolution(stablehlo::ConvolutionOp convOp) {
+  auto inputDistOrFailure = getDistribution(convOp.getLhs());
+  auto kernelDistOrFailure = getDistribution(convOp.getRhs());
   if (failed(inputDistOrFailure) || failed(kernelDistOrFailure)) {
     return convOp.emitError()
            << "Missing distribution info for at least one of the inputs.";
@@ -319,70 +337,126 @@ DistributionAnalysis::visitConv2D(linalg::Conv2DNchwFchwOp convOp) {
   const auto *inputDist = *inputDistOrFailure;
   const auto *kernelDist = *kernelDistOrFailure;
 
-  auto inputShape = llvm::cast<ShapedType>(inputs[0].getType()).getShape();
-  auto kernelShape = llvm::cast<ShapedType>(inputs[1].getType()).getShape();
+  auto inputShape =
+      llvm::cast<ShapedType>(convOp.getLhs().getType()).getShape();
+  auto kernelShape =
+      llvm::cast<ShapedType>(convOp.getRhs().getType()).getShape();
 
-  auto inputChannels = inputShape[1];
-  auto kernelHeight = kernelShape[2];
-  auto kernelWidth = kernelShape[3];
+  // The dimension numbers make this layout-agnostic (i.e. not restricted to
+  // NCHW/FCHW convolutions).
+  auto dimNumbers = convOp.getDimensionNumbers();
+  auto inputChannels = inputShape[dimNumbers.getInputFeatureDimension()] /
+                       convOp.getFeatureGroupCount();
 
   // This is the size of the number of elements in the "sliding window" of
   // convolution
-  auto contractionSize = inputChannels * kernelHeight * kernelWidth;
+  int64_t contractionSize = inputChannels;
+  for (auto dim : dimNumbers.getKernelSpatialDimensions()) {
+    contractionSize *= kernelShape[dim];
+  }
 
   Distribution outputDist = getMatrixMultiplicationDistribution(
       contractionSize, inputDist, kernelDist);
 
-  this->distributionMap[convOp.getResult(0)] = outputDist;
+  this->distributionMap[convOp.getResult()] = outputDist;
   this->analyzedOperations.insert(convOp);
 
   return success();
 }
 
-LogicalResult DistributionAnalysis::visitFill(linalg::FillOp fillOp) {
-  auto inputs = fillOp.getInputs();
-  assert(inputs.size() == 1 && "Expected linalg.fill to have exactly 1 input");
+LogicalResult DistributionAnalysis::visitReductionLike(Operation *op,
+                                                       Value input,
+                                                       Region &body,
+                                                       int64_t reduceSize) {
+  auto inputDistOrFailure = getDistribution(input);
+  if (failed(inputDistOrFailure)) {
+    return op->emitError() << "Missing distribution info for input.";
+  }
+  const auto *inputDist = *inputDistOrFailure;
 
-  auto constOp = inputs[0].getDefiningOp<arith::ConstantOp>();
-  if (!inputs[0].getType().isFloat() || !constOp) {
-    return fillOp.emitError()
-           << "Expected linalg.fill input to be a floating point scalar";
+  // The body must consist of a single reduction op followed by the implicit
+  // stablehlo.return terminator.
+  auto &bodyOps = body.front().getOperations();
+  if (bodyOps.size() != 2) {
+    return op->emitError() << "Unsupported reduction body in " << op->getName();
   }
 
-  double fillValue =
-      llvm::cast<FloatAttr>(constOp.getValue()).getValueAsDouble();
-  Distribution outputDist = {
-      .min = fillValue, .max = fillValue, .mean = fillValue, .variance = 0.0};
+  auto &reductionOp = bodyOps.front();
+  Distribution outputDist;
+  if (llvm::isa<stablehlo::AddOp>(reductionOp)) {
+    // Sum reduction.
+    outputDist = {.min = inputDist->min * reduceSize,
+                  .max = inputDist->max * reduceSize,
+                  .mean = inputDist->mean * reduceSize,
+                  // FIXME: There probably is a more accurate way to estimate
+                  // this
+                  .variance = inputDist->variance * reduceSize};
+  } else if (llvm::isa<stablehlo::MaxOp>(reductionOp)) {
+    // Max reduction.
+    outputDist = {.min = inputDist->min,
+                  .max = inputDist->max,
+                  // FIMXE: This estimation can be improved
+                  .mean = inputDist->mean + inputDist->variance,
+                  .variance = inputDist->variance};
+  } else {
+    return op->emitError() << "Unsupported reduction in " << op->getName()
+                           << ": " << reductionOp.getName();
+  }
 
-  this->distributionMap[fillOp.getResult(0)] = outputDist;
-  this->analyzedOperations.insert(fillOp);
+  this->distributionMap[op->getResult(0)] = outputDist;
+  this->analyzedOperations.insert(op);
 
   return success();
 }
 
-LogicalResult DistributionAnalysis::visitPad(tensor::PadOp padOp) {
-  auto source = padOp.getSource();
+LogicalResult DistributionAnalysis::visitReduceWindow(
+    stablehlo::ReduceWindowOp reduceWindowOp) {
+  if (reduceWindowOp.getInputs().size() != 1) {
+    return reduceWindowOp.emitError()
+           << "Expected stablehlo.reduce_window to have exactly 1 input";
+  }
+
+  auto input = reduceWindowOp.getInputs().front();
+  int64_t windowSize = llvm::accumulate(reduceWindowOp.getWindowDimensions(),
+                                        /*Init=*/1, std::multiplies<int64_t>());
+  return visitReductionLike(reduceWindowOp, input, reduceWindowOp.getBody(),
+                            windowSize);
+}
+
+LogicalResult DistributionAnalysis::visitReduce(stablehlo::ReduceOp reduceOp) {
+  if (reduceOp.getInputs().size() != 1) {
+    return reduceOp.emitError()
+           << "Expected stablehlo.reduce to have exactly 1 input";
+  }
+
+  auto input = reduceOp.getInputs().front();
+  auto inputShape = llvm::cast<ShapedType>(input.getType()).getShape();
+  int64_t reduceSize = 1;
+  for (int64_t dim : reduceOp.getDimensions()) {
+    if (inputShape[dim] == ShapedType::kDynamic) {
+      return reduceOp.emitError()
+             << "Dynamic reduced dimensions are not supported";
+    }
+    reduceSize *= inputShape[dim];
+  }
+
+  return visitReductionLike(reduceOp, input, reduceOp.getBody(), reduceSize);
+}
+
+LogicalResult DistributionAnalysis::visitPad(stablehlo::PadOp padOp) {
+  auto source = padOp.getOperand();
   auto sourceDistOrFailure = getDistribution(source);
   if (failed(sourceDistOrFailure)) {
     return padOp.emitError() << "Missing distribution info for source.";
   }
   const auto *sourceDist = *sourceDistOrFailure;
 
-  // Get value used for padding
-  auto &ops = padOp.getBody()->getOperations();
-  if (ops.size() != 1) {
+  auto padValueOrFailure = getScalarConstantValue(padOp.getPaddingValue());
+  if (failed(padValueOrFailure)) {
     return padOp.emitError()
-           << "Expected pad body to have exactly 1 operation (tensor.yield)";
+           << "Expected pad value to be a scalar or splat float constant";
   }
-  auto constOp = llvm::cast<tensor::YieldOp>(ops.back())
-                     .getValue()
-                     .getDefiningOp<arith::ConstantOp>();
-  if (!constOp || !constOp.getType().isFloat()) {
-    return padOp.emitError() << "Expected pad value to be defined by a "
-                                "floating point scalar constant";
-  }
-  double padValue =
-      llvm::cast<FloatAttr>(constOp.getValue()).getValueAsDouble();
+  double padValue = *padValueOrFailure;
 
   if (!std::isfinite(padValue)) {
     padOp->emitWarning() << "Pad value is NaN/Inf. Treating pad as identity "
@@ -406,10 +480,12 @@ LogicalResult DistributionAnalysis::visitPad(tensor::PadOp padOp) {
   };
 
   // Compute size of source tensor
-  auto sourceShape = source.getType().getShape();
+  auto sourceShape = llvm::cast<ShapedType>(source.getType()).getShape();
   size_t tensorSize = getTensorSize(sourceShape);
-  // Compute size of padding
-  auto outShape = padOp.getResult().getType().getShape();
+  // Compute size of padding. This accounts for both edge and interior
+  // padding, since both are reflected in the result shape.
+  auto outShape =
+      llvm::cast<ShapedType>(padOp.getResult().getType()).getShape();
   size_t outSize = getTensorSize(outShape);
   size_t padSize = outSize - tensorSize;
 
@@ -434,62 +510,8 @@ LogicalResult DistributionAnalysis::visitPad(tensor::PadOp padOp) {
 }
 
 LogicalResult
-DistributionAnalysis::visitSumPooling(linalg::PoolingNchwSumOp poolingOp) {
-  auto inputs = poolingOp.getInputs();
-  assert(inputs.size() == 2 &&
-         "Expected linalg.pooling_nchw_sum to have exactly 2 inputs");
-
-  auto input = inputs[0];
-  auto inputDistOrFailure = getDistribution(input);
-  if (failed(inputDistOrFailure)) {
-    return poolingOp.emitError() << "Missing distribution info for input.";
-  }
-
-  auto kernel = inputs[1];
-  auto kernelShape = llvm::cast<ShapedType>(kernel.getType()).getShape();
-  auto poolingWindowSize = kernelShape[0] * kernelShape[1];
-
-  const auto *inputDist = *inputDistOrFailure;
-  Distribution outputDist = {
-      .min = inputDist->min * poolingWindowSize,
-      .max = inputDist->max * poolingWindowSize,
-      .mean = inputDist->mean * poolingWindowSize,
-      // FIXME: There probably is a more accurate way to estimate this
-      .variance = inputDist->variance * poolingWindowSize};
-
-  this->distributionMap[poolingOp->getResult(0)] = outputDist;
-  this->analyzedOperations.insert(poolingOp);
-
-  return success();
-}
-
-LogicalResult
-DistributionAnalysis::visitMaxPooling(linalg::PoolingNchwMaxOp poolingOp) {
-  auto inputs = poolingOp.getInputs();
-  assert(inputs.size() == 2 &&
-         "Expected linalg.pooling_nchw_max to have exactly 2 inputs");
-
-  auto input = inputs[0];
-  auto inputDistOrFailure = getDistribution(input);
-  if (failed(inputDistOrFailure)) {
-    return poolingOp.emitError() << "Missing distribution info for input.";
-  }
-
-  const auto *inputDist = *inputDistOrFailure;
-  Distribution outputDist = {.min = inputDist->min,
-                             .max = inputDist->max,
-                             // FIMXE: This estimation can be improved
-                             .mean = inputDist->mean + inputDist->variance,
-                             .variance = inputDist->variance};
-
-  this->distributionMap[poolingOp->getResult(0)] = outputDist;
-  this->analyzedOperations.insert(poolingOp);
-
-  return success();
-}
-
-LogicalResult DistributionAnalysis::visitConcat(tensor::ConcatOp concatOp) {
-  auto axis = concatOp.getDim();
+DistributionAnalysis::visitConcatenate(stablehlo::ConcatenateOp concatOp) {
+  auto axis = concatOp.getDimension();
 
   llvm::SmallVector<uint64_t> dims;
   auto inputs = concatOp.getInputs();
@@ -537,56 +559,40 @@ LogicalResult DistributionAnalysis::visitConcat(tensor::ConcatOp concatOp) {
   return success();
 }
 
-LogicalResult DistributionAnalysis::visitCollapseShape(
-    tensor::CollapseShapeOp collapseShapeOp) {
-  auto input = collapseShapeOp.getSrc();
-  auto inputDistOrFailure = getDistribution(input);
-  if (failed(inputDistOrFailure)) {
-    return collapseShapeOp.emitError()
-           << "Missing distribution info for source.";
-  }
-
-  // FIXME: Assume tensor.collapse_shape is an identity. Does this always hold?
-  this->distributionMap[collapseShapeOp->getResult(0)] = *(*inputDistOrFailure);
-  this->analyzedOperations.insert(collapseShapeOp);
-
-  return success();
-}
-
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
-      .Case<arith::ConstantOp>(
-          [&](arith::ConstantOp constOp) { return visitConstantOp(constOp); })
-      .Case<linalg::AddOp>(
-          [&](linalg::AddOp addOp) { return visitAddOp(addOp); })
-      .Case<linalg::GenericOp>([&](linalg::GenericOp genericOp) {
-        return visitGenericOp(genericOp);
+      .Case<stablehlo::ConstantOp>([&](stablehlo::ConstantOp constOp) {
+        return visitConstantLikeOp(constOp, constOp.getValue());
       })
-      .Case<linalg::BroadcastOp>([&](linalg::BroadcastOp broadcastOp) {
-        return visitUnaryIdentityOp(broadcastOp);
+      .Case<arith::ConstantOp>([&](arith::ConstantOp constOp) {
+        return visitConstantLikeOp(constOp, constOp.getValue());
       })
-      .Case<linalg::TransposeOp>([&](linalg::TransposeOp transposeOp) {
-        return visitUnaryIdentityOp(transposeOp);
+      .Case<stablehlo::AddOp>(
+          [&](stablehlo::AddOp addOp) { return visitAddOp(addOp); })
+      .Case<stablehlo::MaxOp>(
+          [&](stablehlo::MaxOp maxOp) { return visitMaxOp(maxOp); })
+      .Case<stablehlo::DivOp>(
+          [&](stablehlo::DivOp divOp) { return visitDivOp(divOp); })
+      .Case<stablehlo::BroadcastInDimOp, stablehlo::TransposeOp,
+            stablehlo::ReshapeOp>([&](Operation *identityOp) {
+        return visitUnaryIdentityOp(identityOp);
       })
-      .Case<linalg::MatmulOp>(
-          [&](linalg::MatmulOp matmulOp) { return visitMatmul(matmulOp); })
-      .Case<linalg::Conv2DNchwFchwOp>(
-          [&](linalg::Conv2DNchwFchwOp convOp) { return visitConv2D(convOp); })
-      .Case<linalg::FillOp>(
-          [&](linalg::FillOp fillOp) { return visitFill(fillOp); })
-      .Case<tensor::PadOp>([&](tensor::PadOp padOp) { return visitPad(padOp); })
-      .Case<linalg::PoolingNchwSumOp>([&](linalg::PoolingNchwSumOp poolingOp) {
-        return visitSumPooling(poolingOp);
+      .Case<stablehlo::DotGeneralOp>(
+          [&](stablehlo::DotGeneralOp dotOp) { return visitDotGeneral(dotOp); })
+      .Case<stablehlo::ConvolutionOp>([&](stablehlo::ConvolutionOp convOp) {
+        return visitConvolution(convOp);
       })
-      .Case<linalg::PoolingNchwMaxOp>([&](linalg::PoolingNchwMaxOp poolingOp) {
-        return visitMaxPooling(poolingOp);
-      })
-      .Case<tensor::ConcatOp>(
-          [&](tensor::ConcatOp concatOp) { return visitConcat(concatOp); })
-      .Case<tensor::CollapseShapeOp>(
-          [&](tensor::CollapseShapeOp collapseShapeOp) {
-            return visitCollapseShape(collapseShapeOp);
+      .Case<stablehlo::ReduceWindowOp>(
+          [&](stablehlo::ReduceWindowOp reduceWindowOp) {
+            return visitReduceWindow(reduceWindowOp);
           })
+      .Case<stablehlo::ReduceOp>(
+          [&](stablehlo::ReduceOp reduceOp) { return visitReduce(reduceOp); })
+      .Case<stablehlo::PadOp>(
+          [&](stablehlo::PadOp padOp) { return visitPad(padOp); })
+      .Case<stablehlo::ConcatenateOp>([&](stablehlo::ConcatenateOp concatOp) {
+        return visitConcatenate(concatOp);
+      })
       .Default([&](Operation *op) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities?

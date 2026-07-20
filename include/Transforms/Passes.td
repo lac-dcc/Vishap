@@ -6,6 +6,7 @@ include "mlir/Pass/PassBase.td"
 def AnnotateDistributionsPass
     : Pass<"annotate-distributions", "mlir::func::FuncOp"> {
   let summary = "Annotate IR with distribution information from propagation analysis";
+  let dependentDialects = ["mlir::stablehlo::StablehloDialect"];
   let options = [
     Option<
       "inputDists",
@@ -20,7 +21,7 @@ def AnnotateDistributionsPass
 def AddProbeCallsPass
     : Pass<"add-probe-calls", "mlir::func::FuncOp"> {
   let summary = "Add calls for observing tensor values at runtime";
-  let dependentDialects = ["probe::ProbeDialect"];
+  let dependentDialects = ["mlir::probe::ProbeDialect"];
 }
 
 #endif // VISHAP_TRANSFORMS_PASSES_TD
