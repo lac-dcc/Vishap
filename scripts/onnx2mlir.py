@@ -95,8 +95,8 @@ def convert_onnx_to_mlir(
 
         passes = [
             "torch-onnx-to-torch-backend-pipeline",
-            "torch-backend-to-linalg-on-tensors-backend-pipeline",
-            "linalg-specialize-generic-ops"
+            "torch-backend-to-stablehlo-backend-pipeline",
+            "canonicalize",
         ]
         try:
             imp = onnx_importer.NodeImporter.define_function(model_info.main_graph, m)
@@ -107,7 +107,7 @@ def convert_onnx_to_mlir(
             run_pipeline_with_repro_report(
                 m,
                 f"builtin.module({pipeline})",
-                "Lowering Torch ONNX -> Linalg-on-Tensors Backend IR",
+                "Lowering Torch ONNX -> StableHLO Backend IR",
             )
         except Exception:
             logger.error("Failed to lower ONNX to MLIR")

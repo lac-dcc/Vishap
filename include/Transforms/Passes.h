@@ -2,6 +2,7 @@
 #define VISHAP_INCLUDE_TRANSFORMS_PASSES_H
 
 #include "mlir/Pass/Pass.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 
 namespace mlir {
 namespace vishap {
