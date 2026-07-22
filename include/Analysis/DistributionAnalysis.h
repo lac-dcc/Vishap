@@ -32,6 +32,8 @@ private:
 
   LogicalResult visitAddOp(stablehlo::AddOp addOp);
 
+  LogicalResult visitSubtractOp(stablehlo::SubtractOp subOp);
+
   /// Propagate distribution for a value that is clamped from below at
   /// \p clampValue (e.g. ReLU when \p clampValue is 0).
   LogicalResult visitClamp(Operation *op, Value input, double clampValue);
@@ -60,6 +62,8 @@ private:
   LogicalResult visitPad(stablehlo::PadOp padOp);
 
   LogicalResult visitConcatenate(stablehlo::ConcatenateOp concatOp);
+
+  LogicalResult visitExpOp(stablehlo::ExpOp expOp);
 
   LogicalResult visitOperation(Operation *op);
 

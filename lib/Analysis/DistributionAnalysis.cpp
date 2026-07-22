@@ -131,6 +131,31 @@ LogicalResult DistributionAnalysis::visitAddOp(stablehlo::AddOp addOp) {
   return success();
 }
 
+LogicalResult
+DistributionAnalysis::visitSubtractOp(stablehlo::SubtractOp subOp) {
+  auto lhsDistOrFailure = getDistribution(subOp.getLhs());
+  auto rhsDistOrFailure = getDistribution(subOp.getRhs());
+  if (failed(lhsDistOrFailure) || failed(rhsDistOrFailure)) {
+    return subOp.emitError()
+           << "Missing distribution info for at least one of the inputs.";
+  }
+
+  const auto *lhsDist = *lhsDistOrFailure;
+  const auto *rhsDist = *rhsDistOrFailure;
+
+  // Same premises as addition
+  Distribution outputDist;
+  outputDist.min = lhsDist->min - rhsDist->max;
+  outputDist.max = lhsDist->max - rhsDist->min;
+  outputDist.mean = lhsDist->mean - rhsDist->mean;
+  outputDist.variance = lhsDist->variance + rhsDist->variance;
+
+  this->distributionMap[subOp.getResult()] = outputDist;
+  this->analyzedOperations.insert(subOp);
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitClamp(Operation *op, Value input,
                                                double clampValue) {
   auto inputDistOrFailure = getDistribution(input);
@@ -559,6 +584,28 @@ DistributionAnalysis::visitConcatenate(stablehlo::ConcatenateOp concatOp) {
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitExpOp(stablehlo::ExpOp expOp) {
+  auto input = expOp.getOperand();
+  auto inputDistOrFailure = getDistribution(input);
+  if (failed(inputDistOrFailure)) {
+    return expOp.emitError()
+           << "Missing distribution info for exponential operand.";
+  }
+
+  const auto *inputDist = *inputDistOrFailure;
+  Distribution outputDist;
+  outputDist.mean = std::exp(inputDist->mean + (inputDist->variance / 2));
+  outputDist.variance = (std::exp(inputDist->variance) - 1) *
+                        (std::exp(2 * inputDist->mean + inputDist->variance));
+  outputDist.min = std::exp(inputDist->min);
+  outputDist.max = std::exp(inputDist->max);
+
+  this->distributionMap[expOp.getResult()] = outputDist;
+  this->analyzedOperations.insert(expOp);
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
       .Case<stablehlo::ConstantOp>([&](stablehlo::ConstantOp constOp) {
@@ -569,6 +616,8 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       })
       .Case<stablehlo::AddOp>(
           [&](stablehlo::AddOp addOp) { return visitAddOp(addOp); })
+      .Case<stablehlo::SubtractOp>(
+          [&](stablehlo::SubtractOp subOp) { return visitSubtractOp(subOp); })
       .Case<stablehlo::MaxOp>(
           [&](stablehlo::MaxOp maxOp) { return visitMaxOp(maxOp); })
       .Case<stablehlo::DivOp>(
@@ -593,6 +642,8 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       .Case<stablehlo::ConcatenateOp>([&](stablehlo::ConcatenateOp concatOp) {
         return visitConcatenate(concatOp);
       })
+      .Case<stablehlo::ExpOp>(
+          [&](stablehlo::ExpOp expOp) { return visitExpOp(expOp); })
       .Default([&](Operation *op) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities?
