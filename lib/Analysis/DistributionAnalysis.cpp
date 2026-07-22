@@ -61,6 +61,17 @@ distributionToArrayAttr(Builder &builder, const Distribution &distribution) {
           builder.getF64FloatAttr(distribution.variance)};
 }
 
+void DistributionAnalysis::registerDistributions(
+    Operation *op, llvm::ArrayRef<Distribution> dists) {
+  assert(op->getNumResults() == dists.size() &&
+         "Number of distributions does not match number of operation results.");
+
+  for (const auto &[result, dist] : llvm::zip(op->getResults(), dists)) {
+    this->distributionMap[result] = dist;
+  }
+  this->analyzedOperations.insert(op);
+}
+
 LogicalResult DistributionAnalysis::visitConstantLikeOp(Operation *op,
                                                         Attribute valueAttr) {
   assert(op->getNumResults() == 1 &&
@@ -81,17 +92,16 @@ LogicalResult DistributionAnalysis::visitConstantLikeOp(Operation *op,
 
   // Extract the constant value and update the distribution map
   if (auto denseAttr = llvm::dyn_cast<DenseElementsAttr>(valueAttr)) {
+    Distribution dist;
     switch (tensorType.getElementType().getIntOrFloatBitWidth()) {
     case 32: {
       auto values = denseAttr.getValues<float>();
-      this->distributionMap[op->getResult(0)] =
-          computeFloatRangeDistribution<float, decltype(values)>(values);
+      dist = computeFloatRangeDistribution<float, decltype(values)>(values);
       break;
     }
     case 64: {
       auto values = denseAttr.getValues<double>();
-      this->distributionMap[op->getResult(0)] =
-          computeFloatRangeDistribution<double, decltype(values)>(values);
+      dist = computeFloatRangeDistribution<double, decltype(values)>(values);
       break;
     }
     default:
@@ -99,9 +109,9 @@ LogicalResult DistributionAnalysis::visitConstantLikeOp(Operation *op,
              << "Unsupported element type for distribution analysis: "
              << tensorType.getElementType();
     }
+    this->registerDistributions(op, {dist});
   }
 
-  this->analyzedOperations.insert(op);
   return success();
 }
 
@@ -125,8 +135,7 @@ LogicalResult DistributionAnalysis::visitAddOp(stablehlo::AddOp addOp) {
   outputDist.mean = lhsDist->mean + rhsDist->mean;
   outputDist.variance = lhsDist->variance + rhsDist->variance;
 
-  this->distributionMap[addOp.getResult()] = outputDist;
-  this->analyzedOperations.insert(addOp);
+  this->registerDistributions(addOp, {outputDist});
 
   return success();
 }
@@ -150,8 +159,7 @@ DistributionAnalysis::visitSubtractOp(stablehlo::SubtractOp subOp) {
   outputDist.mean = lhsDist->mean - rhsDist->mean;
   outputDist.variance = lhsDist->variance + rhsDist->variance;
 
-  this->distributionMap[subOp.getResult()] = outputDist;
-  this->analyzedOperations.insert(subOp);
+  this->registerDistributions(subOp, {outputDist});
 
   return success();
 }
@@ -202,8 +210,7 @@ LogicalResult DistributionAnalysis::visitClamp(Operation *op, Value input,
                              .mean = rectifiedMean,
                              .variance = rectifiedVariance};
 
-  this->distributionMap[op->getResult(0)] = outputDist;
-  this->analyzedOperations.insert(op);
+  this->registerDistributions(op, {outputDist});
 
   return success();
 }
@@ -266,8 +273,7 @@ LogicalResult DistributionAnalysis::visitDivOp(stablehlo::DivOp divOp) {
   outputDist.min = std::min(std::min(c00, c01), std::min(c10, c11));
   outputDist.max = std::max(std::max(c00, c01), std::max(c10, c11));
 
-  this->distributionMap[divOp.getResult()] = outputDist;
-  this->analyzedOperations.insert(divOp);
+  this->registerDistributions(divOp, {outputDist});
 
   return success();
 }
@@ -282,8 +288,7 @@ LogicalResult DistributionAnalysis::visitUnaryIdentityOp(Operation *op) {
     return op->emitError() << "Missing distribution info for input.";
   }
 
-  this->distributionMap[op->getResult(0)] = *(*inputDistOrFailure);
-  this->analyzedOperations.insert(op);
+  this->registerDistributions(op, {*(*inputDistOrFailure)});
 
   return success();
 }
@@ -345,8 +350,7 @@ DistributionAnalysis::visitDotGeneral(stablehlo::DotGeneralOp dotOp) {
   Distribution outputDist =
       getMatrixMultiplicationDistribution(contractionSize, lhsDist, rhsDist);
 
-  this->distributionMap[dotOp.getResult()] = outputDist;
-  this->analyzedOperations.insert(dotOp);
+  this->registerDistributions(dotOp, {outputDist});
 
   return success();
 }
@@ -383,8 +387,7 @@ DistributionAnalysis::visitConvolution(stablehlo::ConvolutionOp convOp) {
   Distribution outputDist = getMatrixMultiplicationDistribution(
       contractionSize, inputDist, kernelDist);
 
-  this->distributionMap[convOp.getResult()] = outputDist;
-  this->analyzedOperations.insert(convOp);
+  this->registerDistributions(convOp, {outputDist});
 
   return success();
 }
@@ -428,8 +431,7 @@ LogicalResult DistributionAnalysis::visitReductionLike(Operation *op,
                            << ": " << reductionOp.getName();
   }
 
-  this->distributionMap[op->getResult(0)] = outputDist;
-  this->analyzedOperations.insert(op);
+  this->registerDistributions(op, {outputDist});
 
   return success();
 }
@@ -486,8 +488,7 @@ LogicalResult DistributionAnalysis::visitPad(stablehlo::PadOp padOp) {
   if (!std::isfinite(padValue)) {
     padOp->emitWarning() << "Pad value is NaN/Inf. Treating pad as identity "
                             "for distribution analysis.";
-    this->distributionMap[padOp.getResult()] = (*sourceDist);
-    this->analyzedOperations.insert(padOp);
+    this->registerDistributions(padOp, {*sourceDist});
     return success();
   }
 
@@ -528,8 +529,7 @@ LogicalResult DistributionAnalysis::visitPad(stablehlo::PadOp padOp) {
   outputDist.min = std::min(sourceDist->min, padValue);
   outputDist.max = std::max(sourceDist->max, padValue);
 
-  this->distributionMap[padOp.getResult()] = outputDist;
-  this->analyzedOperations.insert(padOp);
+  this->registerDistributions(padOp, {outputDist});
 
   return success();
 }
@@ -578,8 +578,7 @@ DistributionAnalysis::visitConcatenate(stablehlo::ConcatenateOp concatOp) {
   Distribution outputDist = {
       .min = min, .max = max, .mean = mean, .variance = variance};
 
-  this->distributionMap[concatOp.getResult()] = outputDist;
-  this->analyzedOperations.insert(concatOp);
+  this->registerDistributions(concatOp, {outputDist});
 
   return success();
 }
@@ -600,8 +599,7 @@ LogicalResult DistributionAnalysis::visitExpOp(stablehlo::ExpOp expOp) {
   outputDist.min = std::exp(inputDist->min);
   outputDist.max = std::exp(inputDist->max);
 
-  this->distributionMap[expOp.getResult()] = outputDist;
-  this->analyzedOperations.insert(expOp);
+  this->registerDistributions(expOp, {outputDist});
 
   return success();
 }

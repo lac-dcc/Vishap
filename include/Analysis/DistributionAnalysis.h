@@ -26,6 +26,9 @@ private:
 
   llvm::DenseMap<Value, Distribution> distributionMap;
 
+  /// Register \p dists as distributions describing the results of \p op.
+  void registerDistributions(Operation *op, llvm::ArrayRef<Distribution> dists);
+
   /// Compute the empirical distribution of a constant-like operation whose
   /// value is given by \p valueAttr.
   LogicalResult visitConstantLikeOp(Operation *op, Attribute valueAttr);
