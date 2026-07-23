@@ -696,7 +696,7 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
   }
 
   if (func.getNumArguments() != distAttr.size()) {
-    return func.emitError()
+    return mlir::emitError(func->getLoc())
            << "Size of args distribution attribute (" << distAttr.size()
            << ") must match the number of "
               "function arguments ("
@@ -719,13 +719,13 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
 
 LogicalResult DistributionAnalysis::run(func::FuncOp func) {
   if (failed(getDistributionForArgs(func))) {
-    return func.emitError()
+    return mlir::emitError(func->getLoc())
            << "Failed to get distribution info for function arguments";
   }
 
   for (auto &op : func.getBody().front().getOperations()) {
     if (failed(visitOperation(&op))) {
-      return func.emitError()
+      return mlir::emitError(func->getLoc())
              << "Failed to analyze distribution for operation: "
              << op.getName();
     }
