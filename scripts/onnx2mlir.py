@@ -96,6 +96,7 @@ def convert_onnx_to_mlir(
         passes = [
             "torch-onnx-to-torch-backend-pipeline",
             "torch-backend-to-stablehlo-backend-pipeline",
+            "func.func(stablehlo-aggressive-simplification)",
             "canonicalize",
         ]
         try:
