@@ -37,13 +37,15 @@ private:
 
   LogicalResult visitSubtractOp(stablehlo::SubtractOp subOp);
 
+  LogicalResult visitMulOp(stablehlo::MulOp mulOp);
+
+  LogicalResult visitDivOp(stablehlo::DivOp divOp);
+
   /// Propagate distribution for a value that is clamped from below at
   /// \p clampValue (e.g. ReLU when \p clampValue is 0).
   LogicalResult visitClamp(Operation *op, Value input, double clampValue);
 
   LogicalResult visitMaxOp(stablehlo::MaxOp maxOp);
-
-  LogicalResult visitDivOp(stablehlo::DivOp divOp);
 
   /// Propagate distribution for a unary operation that does not change the
   /// distribution of its input (e.g. transpose, reshape, broadcast).

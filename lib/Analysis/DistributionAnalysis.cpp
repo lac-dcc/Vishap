@@ -164,6 +164,82 @@ DistributionAnalysis::visitSubtractOp(stablehlo::SubtractOp subOp) {
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitMulOp(stablehlo::MulOp mulOp) {
+  auto lhsDistOrFailure = getDistribution(mulOp.getLhs());
+  auto rhsDistOrFailure = getDistribution(mulOp.getRhs());
+  if (failed(lhsDistOrFailure) || failed(rhsDistOrFailure)) {
+    return mulOp.emitError()
+           << "Missing distribution info for at least one of the inputs.";
+  }
+
+  const auto *lhsDist = *lhsDistOrFailure;
+  const auto *rhsDist = *rhsDistOrFailure;
+
+  double prod1 = lhsDist->min * rhsDist->min;
+  double prod2 = lhsDist->min * rhsDist->max;
+  double prod3 = lhsDist->max * rhsDist->min;
+  double prod4 = lhsDist->max * rhsDist->max;
+
+  // Same premises as add
+  double mean = lhsDist->mean * rhsDist->mean;
+  double variance = (lhsDist->variance * rhsDist->variance) +
+                    (lhsDist->variance * (rhsDist->mean * rhsDist->mean)) +
+                    (rhsDist->variance * (lhsDist->mean * lhsDist->mean));
+
+  Distribution outputDist{.min = std::min({prod1, prod2, prod3, prod4}),
+                          .max = std::max({prod1, prod2, prod3, prod4}),
+                          .mean = mean,
+                          .variance = variance};
+
+  this->registerDistributions(mulOp, {outputDist});
+
+  return success();
+}
+
+LogicalResult DistributionAnalysis::visitDivOp(stablehlo::DivOp divOp) {
+  auto lhsDistOrFailure = getDistribution(divOp.getLhs());
+  auto rhsDistOrFailure = getDistribution(divOp.getRhs());
+  if (failed(lhsDistOrFailure) || failed(rhsDistOrFailure)) {
+    return divOp.emitError()
+           << "Missing distribution info for at least one of the inputs.";
+  }
+
+  const auto *lhsDist = *lhsDistOrFailure;
+  const auto *rhsDist = *rhsDistOrFailure;
+
+  // FIXME: this may be too restrictive
+  // The divisor support must not contain zero, otherwise the ratio range is
+  // unbounded / undefined.
+  if (rhsDist->min <= 0.0 && rhsDist->max >= 0.0) {
+    return divOp.emitError()
+           << "Division by a value whose range contains zero is not "
+              "supported in distribution analysis";
+  }
+
+  // Mean/variance assume independent operands (same premise as Add). When the
+  // divisor is degenerate these reduce to exact scaling by a constant.
+  // Min/max are the range of the ratio over the product of the input intervals
+  // (extrema at the corners when the divisor has constant sign).
+  double muY = rhsDist->mean;
+  double muYSq = muY * muY;
+  Distribution outputDist;
+  outputDist.mean = lhsDist->mean / muY;
+  outputDist.variance =
+      lhsDist->variance / muYSq +
+      (lhsDist->mean * lhsDist->mean) * rhsDist->variance / (muYSq * muYSq);
+
+  double c00 = lhsDist->min / rhsDist->min;
+  double c01 = lhsDist->min / rhsDist->max;
+  double c10 = lhsDist->max / rhsDist->min;
+  double c11 = lhsDist->max / rhsDist->max;
+  outputDist.min = std::min({c00, c01, c10, c11});
+  outputDist.max = std::max({c00, c01, c10, c11});
+
+  this->registerDistributions(divOp, {outputDist});
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitClamp(Operation *op, Value input,
                                                double clampValue) {
   auto inputDistOrFailure = getDistribution(input);
@@ -232,50 +308,6 @@ LogicalResult DistributionAnalysis::visitMaxOp(stablehlo::MaxOp maxOp) {
   return maxOp.emitError()
          << "Expected one of the operands of stablehlo.maximum to be a "
             "scalar or splat float constant";
-}
-
-LogicalResult DistributionAnalysis::visitDivOp(stablehlo::DivOp divOp) {
-  auto lhsDistOrFailure = getDistribution(divOp.getLhs());
-  auto rhsDistOrFailure = getDistribution(divOp.getRhs());
-  if (failed(lhsDistOrFailure) || failed(rhsDistOrFailure)) {
-    return divOp.emitError()
-           << "Missing distribution info for at least one of the inputs.";
-  }
-
-  const auto *lhsDist = *lhsDistOrFailure;
-  const auto *rhsDist = *rhsDistOrFailure;
-
-  // FIXME: this may be too restrictive
-  // The divisor support must not contain zero, otherwise the ratio range is
-  // unbounded / undefined.
-  if (rhsDist->min <= 0.0 && rhsDist->max >= 0.0) {
-    return divOp.emitError()
-           << "Division by a value whose range contains zero is not "
-              "supported in distribution analysis";
-  }
-
-  // Mean/variance assume independent operands (same premise as Add). When the
-  // divisor is degenerate these reduce to exact scaling by a constant.
-  // Min/max are the range of the ratio over the product of the input intervals
-  // (extrema at the corners when the divisor has constant sign).
-  double muY = rhsDist->mean;
-  double muYSq = muY * muY;
-  Distribution outputDist;
-  outputDist.mean = lhsDist->mean / muY;
-  outputDist.variance =
-      lhsDist->variance / muYSq +
-      (lhsDist->mean * lhsDist->mean) * rhsDist->variance / (muYSq * muYSq);
-
-  double c00 = lhsDist->min / rhsDist->min;
-  double c01 = lhsDist->min / rhsDist->max;
-  double c10 = lhsDist->max / rhsDist->min;
-  double c11 = lhsDist->max / rhsDist->max;
-  outputDist.min = std::min(std::min(c00, c01), std::min(c10, c11));
-  outputDist.max = std::max(std::max(c00, c01), std::max(c10, c11));
-
-  this->registerDistributions(divOp, {outputDist});
-
-  return success();
 }
 
 LogicalResult DistributionAnalysis::visitUnaryIdentityOp(Operation *op) {
@@ -616,10 +648,12 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
           [&](stablehlo::AddOp addOp) { return visitAddOp(addOp); })
       .Case<stablehlo::SubtractOp>(
           [&](stablehlo::SubtractOp subOp) { return visitSubtractOp(subOp); })
-      .Case<stablehlo::MaxOp>(
-          [&](stablehlo::MaxOp maxOp) { return visitMaxOp(maxOp); })
+      .Case<stablehlo::MulOp>(
+          [&](stablehlo::MulOp mulOp) { return visitMulOp(mulOp); })
       .Case<stablehlo::DivOp>(
           [&](stablehlo::DivOp divOp) { return visitDivOp(divOp); })
+      .Case<stablehlo::MaxOp>(
+          [&](stablehlo::MaxOp maxOp) { return visitMaxOp(maxOp); })
       .Case<stablehlo::BroadcastInDimOp, stablehlo::TransposeOp,
             stablehlo::ReshapeOp>([&](Operation *identityOp) {
         return visitUnaryIdentityOp(identityOp);
