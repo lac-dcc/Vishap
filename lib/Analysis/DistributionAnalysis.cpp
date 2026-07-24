@@ -655,9 +655,12 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       .Case<stablehlo::MaxOp>(
           [&](stablehlo::MaxOp maxOp) { return visitMaxOp(maxOp); })
       .Case<stablehlo::BroadcastInDimOp, stablehlo::TransposeOp,
-            stablehlo::ReshapeOp>([&](Operation *identityOp) {
-        return visitUnaryIdentityOp(identityOp);
-      })
+            stablehlo::ReshapeOp, stablehlo::SliceOp, stablehlo::GatherOp>(
+          [&](Operation *identityOp) {
+            // FIXME: Transfer functions for some of these identities could be
+            // improved if we tracked distribution per axis.
+            return visitUnaryIdentityOp(identityOp);
+          })
       .Case<stablehlo::DotGeneralOp>(
           [&](stablehlo::DotGeneralOp dotOp) { return visitDotGeneral(dotOp); })
       .Case<stablehlo::ConvolutionOp>([&](stablehlo::ConvolutionOp convOp) {

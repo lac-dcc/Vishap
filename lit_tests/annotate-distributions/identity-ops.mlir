@@ -44,3 +44,44 @@ func.func @reshape() -> tensor<2x3x4xf64> {
 // CHECK-SAME:      vishap.distribution = [
 // CHECK-SAME:        [0.000000e+00, 2.300000e+00, 1.1500000000000001, 0.47916666666666674]
 // CHECK-SAME:      ]
+
+func.func @slice() -> tensor<2x2xf32> {
+  %cst = stablehlo.constant dense<[[1., 0.9, 0.41, 0.05], [-0.66, 0.03, 0.5, 0.98], [0., 0., 0., 0.]]> : tensor<3x4xf32>
+  %sliced = stablehlo.slice %cst [1:3, 2:4] : (tensor<3x4xf32>) -> tensor<2x2xf32>
+  return %sliced : tensor<2x2xf32>
+}
+// CHECK-LABEL: func.func @slice
+// CHECK-NEXT:    stablehlo.constant
+// CHECK-SAME:      vishap.distribution = [
+// CHECK-SAME:        [-0.6600000262260437, 1.000000e+00, 0.26749999712531763, 0.23073542038702108]
+// CHECK-SAME:      ]
+// CHECK-NEXT:    stablehlo.slice
+// CHECK-SAME:      vishap.distribution = [
+// CHECK-SAME:        [-0.6600000262260437, 1.000000e+00, 0.26749999712531763, 0.23073542038702108]
+// CHECK-SAME:      ]
+
+func.func @gather() -> tensor<1x2xf32> {
+  %operand = stablehlo.constant dense<[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]]> : tensor<3x3xf32>
+  %indices = stablehlo.constant dense<[1]> : tensor<1xi64>
+  %result = "stablehlo.gather"(%operand, %indices) <{
+    dimension_numbers = #stablehlo.gather<
+      offset_dims = [1],
+      collapsed_slice_dims = [0],
+      start_index_map = [0],
+      index_vector_dim = 1
+    >,
+    slice_sizes = array<i64: 1, 2>,
+    indices_are_sorted = false
+  }> : (tensor<3x3xf32>, tensor<1xi64>) -> tensor<1x2xf32>
+  return %result : tensor<1x2xf32>
+}
+// CHECK-LABEL: func.func @gather
+// CHECK-NEXT:    stablehlo.constant
+// CHECK-SAME:      vishap.distribution = [
+// CHECK-SAME:        [1.000000e+00, 9.000000e+00, 5.000000e+00, 6.666666666666667]
+// CHECK-SAME:      ]
+// CHECK-NEXT:    stablehlo.constant
+// CHECK-NEXT:    stablehlo.gather
+// CHECK-SAME:      vishap.distribution = [
+// CHECK-SAME:        [1.000000e+00, 9.000000e+00, 5.000000e+00, 6.666666666666667]
+// CHECK-SAME:      ]
