@@ -70,6 +70,8 @@ private:
 
   LogicalResult visitExpOp(stablehlo::ExpOp expOp);
 
+  LogicalResult visitConvert(stablehlo::ConvertOp convertOp);
+
   LogicalResult visitOperation(Operation *op);
 
   /// Get distributions for function args, if available.

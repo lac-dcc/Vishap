@@ -10,44 +10,122 @@
 #include <cmath>
 #include <limits>
 #include <numeric>
+#include <type_traits>
 
 namespace mlir::vishap {
 namespace {
 #define DEBUG_TYPE "vishap-analysis"
 
-/// Try to extract the value of a scalar or splat float constant that defines
-/// \p value, looking through shape-preserving ops (broadcast, reshape).
+/// Look through shape-preserving ops (broadcast, reshape) and converts to find
+/// a constant defining op. Returns nullptr if none is found.
+Operation *getConstantDefiningOp(Operation *op) {
+  while (op && llvm::isa<stablehlo::BroadcastInDimOp, stablehlo::ReshapeOp,
+                         stablehlo::ConvertOp>(op)) {
+    op = op->getOperand(0).getDefiningOp();
+  }
+
+  if (!op || !llvm::isa<stablehlo::ConstantOp, arith::ConstantOp>(op)) {
+    return nullptr;
+  }
+  return op;
+}
+
+/// Get value for \p op, assuming it is a constant. Looks through
+/// shape-preserving ops (broadcast, reshape) and converts.
+FailureOr<Attribute> getConstantValue(Operation *op) {
+  Operation *constOp = getConstantDefiningOp(op);
+  if (!constOp) {
+    return failure();
+  }
+
+  if (auto stablehloConst = llvm::dyn_cast<stablehlo::ConstantOp>(constOp)) {
+    return stablehloConst.getValue();
+  }
+  return llvm::cast<arith::ConstantOp>(constOp).getValue();
+}
+
+/// Try to extract the value of a scalar or splat float/integer constant that
+/// defines \p value, looking through shape-preserving ops (broadcast, reshape)
+/// and converts.
 FailureOr<double> getScalarConstantValue(Value value) {
-  Operation *def = value.getDefiningOp();
-  while (def &&
-         llvm::isa<stablehlo::BroadcastInDimOp, stablehlo::ReshapeOp>(def)) {
-    def = def->getOperand(0).getDefiningOp();
-  }
-
-  if (!def) {
+  auto constantValueOrFailure = getConstantValue(value.getDefiningOp());
+  if (failed(constantValueOrFailure)) {
     return failure();
   }
 
-  Attribute valueAttr;
-  if (auto stablehloConst = llvm::dyn_cast<stablehlo::ConstantOp>(def)) {
-    valueAttr = stablehloConst.getValue();
-  } else if (auto arithConst = llvm::dyn_cast<arith::ConstantOp>(def)) {
-    valueAttr = arithConst.getValue();
-  } else {
-    return failure();
-  }
-
+  Attribute valueAttr = *constantValueOrFailure;
   if (auto floatAttr = llvm::dyn_cast<FloatAttr>(valueAttr)) {
     return floatAttr.getValueAsDouble();
   }
 
   auto denseAttr = llvm::dyn_cast<DenseElementsAttr>(valueAttr);
-  if (!denseAttr || !denseAttr.isSplat() ||
-      !llvm::isa<FloatType>(denseAttr.getElementType())) {
+  if (!denseAttr || !denseAttr.isSplat()) {
     return failure();
   }
 
-  return denseAttr.getSplatValue<APFloat>().convertToDouble();
+  if (llvm::isa<FloatType>(denseAttr.getElementType())) {
+    return denseAttr.getSplatValue<APFloat>().convertToDouble();
+  }
+
+  if (auto intTy = llvm::dyn_cast<IntegerType>(denseAttr.getElementType())) {
+    if (intTy.getWidth() > 64) {
+      return failure();
+    }
+    APInt val = denseAttr.getSplatValue<APInt>();
+    return static_cast<double>(intTy.isUnsigned() ? val.getZExtValue()
+                                                  : val.getSExtValue());
+  }
+
+  return failure();
+}
+
+/// Convert a constant \p denseAttr to target float type \p targetType and
+/// compute its empirical distribution. Only types with native C++ casts are
+/// supported.
+template <typename FloatT>
+FailureOr<Distribution>
+computeConvertedConstantDistribution(DenseElementsAttr denseAttr,
+                                     FloatType targetType) {
+  static_assert(std::is_same_v<FloatT, float> || std::is_same_v<FloatT, double>,
+                "FloatT must be float or double");
+
+  Type srcType = denseAttr.getElementType();
+  assert(srcType != targetType &&
+         "Source and destination types must be different for conversion.");
+
+  // f32 <-> f64
+  if (srcType.isF32()) {
+    auto mapped = llvm::map_range(denseAttr.getValues<float>(), [](float v) {
+      return static_cast<FloatT>(v);
+    });
+    return computeFloatRangeDistribution<FloatT, decltype(mapped)>(mapped);
+  }
+  if (srcType.isF64()) {
+    auto mapped = llvm::map_range(denseAttr.getValues<double>(), [](double v) {
+      return static_cast<FloatT>(v);
+    });
+    return computeFloatRangeDistribution<FloatT, decltype(mapped)>(mapped);
+  }
+
+  // integer -> float (bitwidth <= 64)
+  if (auto intTy = llvm::dyn_cast<IntegerType>(srcType)) {
+    if (intTy.getWidth() <= 64) {
+      // Signless/signed → signed convert (matches StableHLO: !isUnsigned)
+      bool isSigned = !intTy.isUnsigned();
+      auto mapped = llvm::map_range(
+          denseAttr.getValues<APInt>(), [=](const APInt &val) -> FloatT {
+            return static_cast<FloatT>(isSigned ? val.getSExtValue()
+                                                : val.getZExtValue());
+          });
+      return computeFloatRangeDistribution<FloatT, decltype(mapped)>(mapped);
+    }
+
+    // Treat wide integers as unsupported
+    return failure();
+  }
+
+  // Treat other float types (e.g., f16) as unsupported
+  return failure();
 }
 } // namespace
 
@@ -518,8 +596,8 @@ LogicalResult DistributionAnalysis::visitPad(stablehlo::PadOp padOp) {
   double padValue = *padValueOrFailure;
 
   if (!std::isfinite(padValue)) {
-    padOp->emitWarning() << "Pad value is NaN/Inf. Treating pad as identity "
-                            "for distribution analysis.";
+    padOp.emitWarning() << "Pad value is NaN/Inf. Treating pad as identity "
+                           "for distribution analysis.";
     this->registerDistributions(padOp, {*sourceDist});
     return success();
   }
@@ -636,6 +714,74 @@ LogicalResult DistributionAnalysis::visitExpOp(stablehlo::ExpOp expOp) {
   return success();
 }
 
+LogicalResult
+DistributionAnalysis::visitConvert(stablehlo::ConvertOp convertOp) {
+  auto result = convertOp.getResult();
+  auto resultElementType =
+      llvm::cast<ShapedType>(result.getType()).getElementType();
+
+  if (!resultElementType.isFloat()) {
+    // Do nothing if target type is not float
+    return success();
+  }
+
+  // If the operand already has distribution info, simply re-use it.
+  Value operand = convertOp.getOperand();
+  auto operandDistIt = this->distributionMap.find(operand);
+  if (operandDistIt != this->distributionMap.end()) {
+    this->registerDistributions(convertOp, {operandDistIt->second});
+    return success();
+  }
+
+  Operation *constOp = getConstantDefiningOp(operand.getDefiningOp());
+  if (!constOp) {
+    // FIXME: For now, we will only handle convert operations that deal with
+    // constants.
+    convertOp.emitError() << "Cannot handle convert op operand.";
+    return failure();
+  }
+
+  auto denseAttr =
+      llvm::dyn_cast<DenseElementsAttr>(*getConstantValue(constOp));
+  if (!denseAttr) {
+    return convertOp.emitError()
+           << "Expected dense elements attribute for convert operand.";
+  }
+
+  auto targetFloatType = llvm::cast<FloatType>(resultElementType);
+  FailureOr<Distribution> distOrFailure;
+  switch (targetFloatType.getWidth()) {
+  case 32:
+    distOrFailure =
+        computeConvertedConstantDistribution<float>(denseAttr, targetFloatType);
+    break;
+  case 64:
+    distOrFailure = computeConvertedConstantDistribution<double>(
+        denseAttr, targetFloatType);
+    break;
+  default:
+    return convertOp.emitError()
+           << "Unsupported element type for distribution analysis: "
+           << resultElementType;
+  }
+
+  if (failed(distOrFailure)) {
+    return convertOp.emitError() << "Unsupported convert operand element type: "
+                                 << denseAttr.getElementType();
+  }
+
+  this->registerDistributions(convertOp, {*distOrFailure});
+
+  // Non-float constants are skipped by visitConstantLikeOp. Retroactively
+  // attach the converted distribution so the constant is annotated too.
+  if (this->distributionMap.find(constOp->getResult(0)) ==
+      this->distributionMap.end()) {
+    this->registerDistributions(constOp, {*distOrFailure});
+  }
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
       .Case<stablehlo::ConstantOp>([&](stablehlo::ConstantOp constOp) {
@@ -679,6 +825,9 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       })
       .Case<stablehlo::ExpOp>(
           [&](stablehlo::ExpOp expOp) { return visitExpOp(expOp); })
+      .Case<stablehlo::ConvertOp>([&](stablehlo::ConvertOp convertOp) {
+        return visitConvert(convertOp);
+      })
       .Default([&](Operation *op) {
         // FIXME: the default behavior should be for unsupported ops to act as
         // identities?

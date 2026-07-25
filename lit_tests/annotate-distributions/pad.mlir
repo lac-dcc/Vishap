@@ -69,3 +69,21 @@ func.func @pad_inf(%arg0: tensor<1x14x13x11xf32>) -> tensor<1x16x16x16xf32>
 // CHECK-SAME:      vishap.distribution = [
 // CHECK-SAME:        [-1.000000e+00, 1.000000e+00, 5.500000e-01, 5.000000e-02]
 // CHECK-SAME:      ]
+
+func.func @pad_converted_one(%arg0: tensor<1x32x10x3xf32>) -> tensor<1x32x32x32xf32>
+            attributes {vishap.args_distribution = [[-1., 12., 3., 4.]]} {
+  %cst = arith.constant dense<1> : tensor<1xi64>
+  %0 = stablehlo.convert %cst : (tensor<1xi64>) -> tensor<1xf32>
+  %1 = stablehlo.reshape %0 : (tensor<1xf32>) -> tensor<f32>
+  %padded = stablehlo.pad %arg0, %1, low = [0, 0, 10, 11], high = [0, 0, 12, 18], interior = [0, 0, 0, 0]
+              : (tensor<1x32x10x3xf32>, tensor<f32>) -> tensor<1x32x32x32xf32>
+  return %padded : tensor<1x32x32x32xf32>
+}
+// CHECK-LABEL: func.func @pad_converted_one
+// CHECK-NEXT:    arith.constant
+// CHECK-NEXT:    stablehlo.convert
+// CHECK-NEXT:    stablehlo.reshape
+// CHECK-NEXT:    stablehlo.pad
+// CHECK-SAME:      vishap.distribution = [
+// CHECK-SAME:        [-1.000000e+00, 1.200000e+01, 1.05859375, 0.2309417724609375]
+// CHECK-SAME:      ]
