@@ -79,6 +79,52 @@ FailureOr<double> getScalarConstantValue(Value value) {
   return failure();
 }
 
+/// Look through reshape / broadcast_in_dim defining \p value.
+Operation *skipReshapeAndBroadcast(Value value) {
+  Operation *op = value.getDefiningOp();
+  while (op &&
+         llvm::isa<stablehlo::BroadcastInDimOp, stablehlo::ReshapeOp>(op)) {
+    op = op->getOperand(0).getDefiningOp();
+  }
+  return op;
+}
+
+/// Check if \p divOp corresponds to a softmax/L1-normalize: x /
+/// broadcast(sum(x)). Looks through reshape and broadcast on the divisor. On
+/// success, returns the number of elements folded into each sum (e.g., the
+/// class count for a typical softmax.).
+FailureOr<int64_t> matchSoftmax(stablehlo::DivOp divOp) {
+  Operation *divisorDef = skipReshapeAndBroadcast(divOp.getRhs());
+  auto reduceOp = llvm::dyn_cast_or_null<stablehlo::ReduceOp>(divisorDef);
+  if (!reduceOp || reduceOp.getInputs().size() != 1) {
+    return failure();
+  }
+
+  // Body must be a single add followed by the return terminator.
+  auto &bodyOps = reduceOp.getBody().front().getOperations();
+  if (bodyOps.size() != 2 || !llvm::isa<stablehlo::AddOp>(bodyOps.front())) {
+    return failure();
+  }
+
+  if (reduceOp.getInputs().front() != divOp.getLhs()) {
+    return failure();
+  }
+
+  auto inputShape =
+      llvm::cast<ShapedType>(reduceOp.getInputs().front().getType()).getShape();
+  int64_t reduceSize = 1;
+  for (int64_t dim : reduceOp.getDimensions()) {
+    if (inputShape[dim] == ShapedType::kDynamic) {
+      return failure();
+    }
+    reduceSize *= inputShape[dim];
+  }
+  if (reduceSize <= 0) {
+    return failure();
+  }
+  return reduceSize;
+}
+
 /// Convert a constant \p denseAttr to target float type \p targetType and
 /// compute its empirical distribution. Only types with native C++ casts are
 /// supported.
@@ -285,23 +331,42 @@ LogicalResult DistributionAnalysis::visitDivOp(stablehlo::DivOp divOp) {
   const auto *lhsDist = *lhsDistOrFailure;
   const auto *rhsDist = *rhsDistOrFailure;
 
-  // FIXME: this may be too restrictive
-  // The divisor support must not contain zero, otherwise the ratio range is
-  // unbounded / undefined.
+  // Softmax / L1-normalize: x / broadcast(sum(x)) with nonnegative x.
+  // Dependence gives tight bounds that independent interval arithmetic cannot:
+  // each output is in [0, 1], and the tensor mean is 1/N (N terms per sum).
+  auto numClassesOrFailure = matchSoftmax(divOp);
+  if (succeeded(numClassesOrFailure) && lhsDist->min >= 0.0) {
+    double mean = 1.0 / static_cast<double>(*numClassesOrFailure);
+    Distribution outputDist{
+        .min = 0.0,
+        .max = 1.0,
+        .mean = mean,
+        // Any value in [0, 1] with mean μ has variance at most μ(1 − μ).
+        .variance = mean * (1.0 - mean)};
+    this->registerDistributions(divOp, {outputDist});
+    return success();
+  }
+
+  // Independent case: if the divisor range includes 0, X/Y is unbounded (or
+  // undefined), so we cannot produce finite min/max.
   if (rhsDist->min <= 0.0 && rhsDist->max >= 0.0) {
     return divOp.emitError()
            << "Division by a value whose range contains zero is not "
               "supported in distribution analysis";
   }
 
-  // Mean/variance assume independent operands (same premise as Add). When the
-  // divisor is degenerate these reduce to exact scaling by a constant.
-  // Min/max are the range of the ratio over the product of the input intervals
-  // (extrema at the corners when the divisor has constant sign).
-  double muY = rhsDist->mean;
-  double muYSq = muY * muY;
+  // Mean estimation divides by the mean, so reject it if it is zero.
+  if (rhsDist->mean == 0.0) {
+    return divOp.emitError() << "Cannot handle division with zero divisor mean";
+  }
+
   Distribution outputDist;
-  outputDist.mean = lhsDist->mean / muY;
+
+  // Assume both random variables are independent.
+  // See Seltman, "Approximations for Mean and Variance of a Ratio"
+  // (https://www.stat.cmu.edu/~hseltman/files/ratio.pdf).
+  double muYSq = rhsDist->mean * rhsDist->mean;
+  outputDist.mean = lhsDist->mean / rhsDist->mean;
   outputDist.variance =
       lhsDist->variance / muYSq +
       (lhsDist->mean * lhsDist->mean) * rhsDist->variance / (muYSq * muYSq);
@@ -882,7 +947,7 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
   }
 
   if (func.getNumArguments() != distAttr.size()) {
-    return mlir::emitError(func->getLoc())
+    return mlir::emitError(func.getLoc())
            << "Size of args distribution attribute (" << distAttr.size()
            << ") must match the number of "
               "function arguments ("
@@ -892,7 +957,7 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
   for (size_t i = 0; i < distAttr.size(); i++) {
     auto operandDistAttr = llvm::cast<ArrayAttr>(distAttr[i]);
     auto distOrFailure =
-        arrayAttrToDistribution(func->getLoc(), operandDistAttr);
+        arrayAttrToDistribution(func.getLoc(), operandDistAttr);
     if (failed(distOrFailure)) {
       return failure();
     }
@@ -905,13 +970,13 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
 
 LogicalResult DistributionAnalysis::run(func::FuncOp func) {
   if (failed(getDistributionForArgs(func))) {
-    return mlir::emitError(func->getLoc())
+    return mlir::emitError(func.getLoc())
            << "Failed to get distribution info for function arguments";
   }
 
   for (auto &op : func.getBody().front().getOperations()) {
     if (failed(visitOperation(&op))) {
-      return mlir::emitError(func->getLoc())
+      return mlir::emitError(func.getLoc())
              << "Failed to analyze distribution for operation: "
              << op.getName();
     }
