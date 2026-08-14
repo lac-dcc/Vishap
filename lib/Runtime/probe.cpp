@@ -22,6 +22,15 @@ extern "C" void _mlir_ciface_probeObserveMemrefF32(UnrankedMemRefType<float> *m,
   distributions.emplace_back(opID, resultID, dist);
 }
 
+extern "C" void _mlir_ciface_probeObserveMemrefF64(UnrankedMemRefType<double> *m,
+                                                   int32_t opID,
+                                                   int32_t resultID) {
+  auto dynMemref = DynamicMemRefType<double>(*m);
+  auto dist =
+      computeFloatRangeDistribution<double, DynamicMemRefType<double>>(dynMemref);
+  distributions.emplace_back(opID, resultID, dist);
+}
+
 // FIXME: pass file path as argument?
 extern "C" PROBE_EXPORT void _mlir_ciface_probeReport() {
   constexpr char outPath[] = "vishap_probe_report.csv";
