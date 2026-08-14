@@ -9,29 +9,47 @@ import subprocess
 # with MLIR_ENABLE_BINDINGS_PYTHON enabled. You also need to update your
 # PYTHONPATH. More information here: https://mlir.llvm.org/docs/Bindings/Python/
 from mlir.execution_engine import ExecutionEngine
-from mlir.ir import Module, Context, UnitAttr, WalkResult
+from mlir.ir import Module, Context, UnitAttr
 from mlir.passmanager import PassManager
 from mlir.runtime import get_ranked_memref_descriptor, ranked_memref_to_numpy
+from pathlib import Path
 
-Stats = tuple[np.float64, np.float64, np.float64, np.float64]
-ROOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir)
-BUILD_DIR = os.path.join(ROOT_DIR, "build")
-VISHAP_OPT = os.path.join(BUILD_DIR, "bin", "vishap-opt")
-TMP_DIR = os.path.join(ROOT_DIR, "tmp", "vishap")
+# The annotated file is in the stablehlo dialect, which is not part of
+# the upstream MLIR Python bindings. Parse it with the torch-mlir
+# bindings instead.
+from torch_mlir.ir import FloatType, RankedTensorType
+from torch_mlir.ir import Module as TorchMlirModule
+from torch_mlir.ir import WalkResult as TorchMlirWalkResult
+
+from utils import (
+    Stats,
+    TMP_DIR,
+    VISHAP_OPT,
+    BUILD_DIR,
+    get_array_stats,
+    load_input_array,
+    parse_io,
+    run_vishap,
+    make_stablehlo_context,
+)
+
+VISHAP_TMP_DIR = TMP_DIR / "vishap"
 
 
 def _parse_network_to_llvm(ctx: Context, filename: str) -> Module:
-    LINALG_TO_LLVM_PIPELINE = """builtin.module(               \
+    STABLEHLO_TO_LLVM_PIPELINE = """builtin.module(            \
         func.func(                                             \
             add-probe-calls,                                   \
             canonicalize,                                      \
             cse                                                \
         ),                                                     \
+        stablehlo-convert-to-signless,                         \
+        func.func(stablehlo-legalize-to-linalg),               \
+        empty-tensor-to-alloc-tensor,                          \
         one-shot-bufferize{bufferize-function-boundaries},     \
         probe-lower-to-func-calls,                             \
         convert-linalg-to-loops,                               \
         convert-scf-to-cf,                                     \
-        convert-cf-to-llvm,                                    \
         expand-strided-metadata,                               \
         lower-affine,                                          \
         finalize-memref-to-llvm,                               \
@@ -39,6 +57,7 @@ def _parse_network_to_llvm(ctx: Context, filename: str) -> Module:
         convert-math-to-libm,                                  \
         convert-arith-to-llvm,                                 \
         convert-index-to-llvm,                                 \
+        convert-cf-to-llvm,                                    \
         func.func(                                             \
             llvm-request-c-wrappers                            \
         ),                                                     \
@@ -52,14 +71,14 @@ def _parse_network_to_llvm(ctx: Context, filename: str) -> Module:
 
     assert os.path.exists(filename), f"{filename} is not a valid file"
 
-    probe_file = os.path.join(
-        TMP_DIR, os.path.basename(filename).replace(".mlir", ".probe.mlir")
+    probe_file = VISHAP_TMP_DIR / os.path.basename(filename).replace(
+        ".mlir", ".probe.mlir"
     )
 
     args = [
         VISHAP_OPT,
         filename,
-        f"--pass-pipeline={LINALG_TO_LLVM_PIPELINE}",
+        f"--pass-pipeline={STABLEHLO_TO_LLVM_PIPELINE}",
         "-o",
         probe_file,
     ]
@@ -67,11 +86,10 @@ def _parse_network_to_llvm(ctx: Context, filename: str) -> Module:
     if output.returncode != 0:
         print("Vishap failed with the following error:")
         print(output.stderr.decode())
-        command_str = " ".join(args)
+        command_str = " ".join([str(arg) for arg in args])
         raise RuntimeError(f'Vishap execution failed. To reproduce run "{command_str}"')
 
-    module = Module.parseFile(probe_file, ctx)
-
+    module = Module.parseFile(str(probe_file), ctx)
     entry_func = module.body.operations[0]
     entry_func.operation.attributes["llvm.emit_c_interface"] = UnitAttr.get()
 
@@ -95,57 +113,26 @@ def _array_to_ranked_memref_ptr(array: np.ndarray):
     return ctypes.pointer(ctypes.pointer(get_ranked_memref_descriptor(array)))
 
 
-def _parse_io(io_desc: str) -> list[tuple[tuple[int], str]]:
-    shapes_and_types = []
-    for desc in io_desc.split(","):
-        shape = desc.split("x")
-        dtype = shape[-1]
-        shape = tuple(int(dim) for dim in shape[:-1])
-        shapes_and_types.append((shape, dtype))
-
-    return shapes_and_types
-
-
-def _create_io_arrays(io_desc: str, is_input: bool) -> list[np.ndarray]:
+def _create_io_arrays(
+    io_desc: str, is_input: bool, input_file: str | None = None
+) -> list[np.ndarray]:
     assert io_desc, "I/O description cannot be empty"
 
-    type_map = {
-        "f32": np.float32,
-        "f64": np.float64,
-        "i8": np.int8,
-        "i16": np.int16,
-        "i32": np.int32,
-        "i64": np.int64,
-        "si8": np.int8,
-        "si16": np.int16,
-        "si32": np.int32,
-        "si64": np.int64,
-        "ui8": np.uint8,
-        "ui16": np.uint16,
-        "ui32": np.uint32,
-        "ui64": np.uint64,
-    }
-
     tensors = []
-    for shape, dtype in _parse_io(io_desc):
-        assert dtype in type_map, f"Unsupported data type: {dtype}"
-        initializer = _init_input if is_input else _init_output
-        tensors.append(initializer(shape, type_map[dtype]))
+    for idx, (shape, dtype) in enumerate(parse_io(io_desc)):
+        if is_input and input_file is not None and idx == 0:
+            # FIXME: for now, only support image input for networks with
+            # single inputs
+            tensors.append(load_input_array(input_file, shape, dtype))
+        else:
+            initializer = _init_input if is_input else _init_output
+            tensors.append(initializer(shape, dtype))
 
     return tensors
 
 
 def _create_io_memref_ptrs(io_arrays: list[np.ndarray]):
     return [_array_to_ranked_memref_ptr(arr) for arr in io_arrays]
-
-
-def _get_array_stats(array: np.ndarray) -> Stats:
-    return (
-        np.float64(array.min()),
-        np.float64(array.max()),
-        np.float64(array.mean()),
-        np.float64(array.var()),
-    )
 
 
 def _run_network(
@@ -158,10 +145,11 @@ def _run_network(
     assert llvm_build_dir, "'LLVM_BUILD_DIR' env variable must be set"
     assert os.path.exists(llvm_build_dir), f"{llvm_build_dir} is not a valid directory"
 
+    llvm_build_path = Path(llvm_build_dir)
     MLIR_SHARED_LIBS = [
-        os.path.join(llvm_build_dir, "lib/libmlir_runner_utils.so"),
-        os.path.join(llvm_build_dir, "lib/libmlir_c_runner_utils.so"),
-        os.path.join(BUILD_DIR, "lib/Runtime/libVishapRuntime.so"),
+        str(llvm_build_path / "lib/libmlir_runner_utils.so"),
+        str(llvm_build_path / "lib/libmlir_c_runner_utils.so"),
+        str(BUILD_DIR / "lib/Runtime/libVishapRuntime.so"),
     ]
 
     with Context() as ctx:
@@ -177,50 +165,11 @@ def _run_network(
     )
 
     output_stats = [
-        _get_array_stats(ranked_memref_to_numpy(ptr[0]).astype(np.float32))
+        get_array_stats(ranked_memref_to_numpy(ptr[0]).astype(np.float32))
         for ptr in output_memref_ptrs
     ]
 
     return output_stats
-
-
-def _stats_to_vishap_arg(stats: list[Stats]) -> str:
-    arg = "input-distributions="
-    input_dists = ";".join(
-        [
-            f"{min_val},{max_val},{mean_val},{var_val}"
-            for min_val, max_val, mean_val, var_val in stats
-        ]
-    )
-
-    return arg + input_dists
-
-
-def _run_vishap(input_model: str, input_stats: list[Stats]) -> str:
-    os.makedirs(TMP_DIR, exist_ok=True)
-
-    input_dists_arg = _stats_to_vishap_arg(input_stats)
-    out_file = os.path.join(
-        TMP_DIR, os.path.basename(input_model).replace(".mlir", ".dist.mlir")
-    )
-
-    # FIXME: Run this through Python bindings
-    args = [
-        VISHAP_OPT,
-        f"--annotate-distributions={input_dists_arg}",
-        input_model,
-        "-o",
-        out_file,
-    ]
-    output = subprocess.run(args, capture_output=True)
-
-    if output.returncode != 0:
-        print("Vishap failed with the following error:")
-        print(output.stderr.decode())
-        command_str = " ".join(args)
-        raise RuntimeError(f'Vishap execution failed. To reproduce run "{command_str}"')
-
-    return out_file
 
 
 def _compute_mape(actual: np.float64, estimate: np.float64) -> np.float64:
@@ -287,21 +236,28 @@ def _output_csv_results(
     out_file: str,
     results: list[tuple[str, np.float64, np.float64, np.float64, np.float64]],
 ):
-    results_dir = os.path.join(ROOT_DIR, "tmp", "results")
+    results_dir = TMP_DIR / "results"
     os.makedirs(results_dir, exist_ok=True)
 
     header = ["op_name", "min_mape", "max_mape", "mean_mape", "var_ratio"]
-    with open(os.path.join(results_dir, out_file), "w", newline="") as file:
+    with open(results_dir / out_file, "w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(header)
         writer.writerows(results)
 
 
+def _is_float_ranked_tensor_type(type_) -> bool:
+    """Identify float tensors. Only float tensors are observed by probe."""
+    return isinstance(type_, RankedTensorType) and isinstance(
+        type_.element_type, FloatType
+    )
+
+
 def _compare_results(vishap_out_file: str):
     # Collect distribution estimations from Vishap
-    with Context() as ctx:
+    with make_stablehlo_context() as ctx:
         ctx.allow_unregistered_dialects = True
-        module = Module.parseFile(vishap_out_file, ctx)
+        module = TorchMlirModule.parseFile(vishap_out_file, ctx)
         entry_func = module.body.operations[0]
 
         op_names = []
@@ -310,20 +266,24 @@ def _compare_results(vishap_out_file: str):
 
         def collect_dists(op):
             if vishap_dist_attr not in op.attributes:
-                return WalkResult.ADVANCE
+                return TorchMlirWalkResult.ADVANCE
 
-            for dist in op.operation.attributes[vishap_dist_attr]:
+            dists = list(op.operation.attributes[vishap_dist_attr])
+            results = list(op.results)
+            # Mirror AddProbeCalls: one observation per float ranked-tensor
+            # result. Skips func.func (no results) and non-float results such
+            # as the i64 constant retroactively annotated from convert.
+            if len(dists) != len(results):
+                return TorchMlirWalkResult.ADVANCE
+
+            for dist, result in zip(dists, results):
+                if not _is_float_ranked_tensor_type(result.type):
+                    continue
                 op_names.append(op.operation.name)
                 estimated_dists.append(tuple(np.float64(val) for val in dist))
-            return WalkResult.ADVANCE
+            return TorchMlirWalkResult.ADVANCE
 
         entry_func.operation.walk(collect_dists)
-
-        # Ignore estimation for func.func, which should be the same as the
-        # last op in the function.
-        if op_names[-1] == "func.func":
-            op_names.pop()
-            estimated_dists.pop()
 
     # Collect true distributions from probe report
     true_dists = []
@@ -336,9 +296,10 @@ def _compare_results(vishap_out_file: str):
             # Ignore opID and resultID
             true_dists.append(tuple(np.float64(val) for val in row[2:]))
 
-    assert len(true_dists) == len(
-        estimated_dists
-    ), "Number of estimated distributions does not match number of reported distributions"
+    assert len(true_dists) == len(estimated_dists), (
+        "Number of estimated distributions does not match number of reported "
+        f"distributions ({len(estimated_dists)} estimated vs {len(true_dists)} reported)"
+    )
 
     results = []
 
@@ -352,7 +313,7 @@ def _compare_results(vishap_out_file: str):
         )
         results.append((op_name, min_mape, max_mape, mean_mape, var_ratio))
 
-    csv_filename = os.path.basename(vishap_out_file).replace(".dist.mlir", ".csv")
+    csv_filename = Path(vishap_out_file).with_suffix(".csv").name
     _output_csv_results(csv_filename, results)
 
 
@@ -379,6 +340,12 @@ def _parse_args():
         required=True,
         help="comma separated list of output tensor shapes and types (e.g., 1x2xui8,3x4x5xf32)",
     )
+    parser.add_argument(
+        "--input-file",
+        type=str,
+        default=None,
+        help="optional image or .npy path; replaces random data for the first --input tensor",
+    )
 
     return parser.parse_args()
 
@@ -386,21 +353,22 @@ def _parse_args():
 def _main():
     args = _parse_args()
 
-    input_arrays = _create_io_arrays(args.input, is_input=True)
+    input_arrays = _create_io_arrays(
+        args.input, is_input=True, input_file=args.input_file
+    )
     output_arrays = _create_io_arrays(args.output, is_input=False)
-    input_stats = [_get_array_stats(arr) for arr in input_arrays]
+    input_stats = [get_array_stats(arr) for arr in input_arrays]
 
     # Save input arrays for later use
     for idx, arr in enumerate(input_arrays):
-        inputs_dir = os.path.join(TMP_DIR, "inputs")
+        inputs_dir = VISHAP_TMP_DIR / "inputs"
         os.makedirs(inputs_dir, exist_ok=True)
-        out_path = os.path.join(
-            inputs_dir,
-            os.path.basename(args.input_model).replace(".mlir", f".input{idx}.npy"),
+        out_path = inputs_dir / os.path.basename(args.input_model).replace(
+            ".mlir", f".input{idx}.npy"
         )
         np.save(out_path, arr)
 
-    vishap_out_file = _run_vishap(args.input_model, input_stats)
+    vishap_out_file = run_vishap(args.input_model, input_stats)
     _run_network(vishap_out_file, input_arrays, output_arrays, args.function)
     _compare_results(vishap_out_file)
 

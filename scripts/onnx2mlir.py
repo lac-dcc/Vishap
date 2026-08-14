@@ -35,12 +35,13 @@ from torch_mlir import ir
 from torch_mlir.extras import onnx_importer
 from torch_mlir.dialects import torch as torch_d
 from torch_mlir.compiler_utils import run_pipeline_with_repro_report
-from typing import NoReturn
 
-logging.basicConfig(
-    format="%(levelname)s: %(message)s",
-    level=logging.INFO
-)
+# This script uses MLIR Python bindings. To run it, you must have a LLVM build
+# with MLIR_ENABLE_BINDINGS_PYTHON enabled. You also need to update your
+# PYTHONPATH. More information here: https://mlir.llvm.org/docs/Bindings/Python/
+from mlir.ir import Module
+
+logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -55,43 +56,65 @@ def _dump_module(module, output_filename, binary_format=False, max_constant=None
         module.write_bytecode(file=output_file)
     else:
         module.print(
-            file=output_file, large_elements_limit=max_constant, assume_verified=True
+            file=output_file,
+            large_elements_limit=max_constant,
+            assume_verified=True,
+            enable_debug_info=True,
         )
 
     if output_file:
         output_file.close()
 
 
+def prepare_onnx_model(model: str | onnx.ModelProto) -> onnx.ModelProto:
+    """Load (if needed), name unnamed nodes, and run shape inference."""
+    if isinstance(model, str):
+        raw_model = onnx.load(model)
+    else:
+        raw_model = model
+
+    # ONNX nodes don't strictly require names. If they are unnamed,
+    # MLIR location tracking drops them. We force a name for every node.
+    for i, node in enumerate(raw_model.graph.node):
+        if not node.name:
+            node.name = f"{node.op_type}_{i}"
+
+    try:
+        return onnx.shape_inference.infer_shapes(raw_model)
+    except onnx.onnx_cpp2py_export.shape_inference.InferenceError:
+        logger.error("Failed to infer shapes for ONNX model")
+        raise
+
+
 def convert_onnx_to_mlir(
-    model_path: str,
-    output_file: str,
+    model: str | onnx.ModelProto,
+    output_file: str = "",
     emit_bytecode: bool = False,
     elide_constant_if_larger: int = None,
-) -> NoReturn:
+) -> Module:
     """Convert ONNX model into an MLIR file, using mainly upstream dialects.
 
     Args:
-        model_path: Path to the target ONNX model.
-        output_file: Path where the ouput MLIR should be saved.
+        model: Path to an ONNX model file, or a pre-loaded ``onnx.ModelProto``.
+        output_file: Path where the ouput MLIR should be dumped. If empty, the module is not dumped.
         emit_bytecode: If True, emits MLIR as bytecode instead of text.
         elide_constant_if_larger: Elide constants in emitted IR if larger than specified value.
 
     Raises:
         May re-raise exceptions from torch-mlir and onnx utilities
+
+    Returns:
+        The imported MLIR module.
     """
 
-    try:
-        raw_model = onnx.load(model_path)
-        inferred_model = onnx.shape_inference.infer_shapes(raw_model)
-    except onnx.onnx_cpp2py_export.shape_inference.InferenceError:
-        logger.error("Failed to load ONNX model")
-        raise
+    inferred_model = prepare_onnx_model(model)
 
     with ir.Context() as ctx:
         torch_d.register_dialect(ctx)
 
         model_info = onnx_importer.ModelInfo(inferred_model)
-        m = model_info.create_module(context=ctx).operation
+        module = model_info.create_module(context=ctx)
+        module_op = module.operation
 
         passes = [
             "torch-onnx-to-torch-backend-pipeline",
@@ -100,13 +123,15 @@ def convert_onnx_to_mlir(
             "canonicalize",
         ]
         try:
-            imp = onnx_importer.NodeImporter.define_function(model_info.main_graph, m)
+            imp = onnx_importer.NodeImporter.define_function(
+                model_info.main_graph, module_op
+            )
             imp.import_all()
-            m.verify()
+            module_op.verify()
             pipeline = ",".join(passes)
             # Same as `torch-mlir-opt -pass-pipeline=<pipeline> <filename>`
             run_pipeline_with_repro_report(
-                m,
+                module_op,
                 f"builtin.module({pipeline})",
                 "Lowering Torch ONNX -> StableHLO Backend IR",
             )
@@ -114,12 +139,15 @@ def convert_onnx_to_mlir(
             logger.error("Failed to lower ONNX to MLIR")
             raise
 
-        _dump_module(
-            m,
-            output_file,
-            binary_format=emit_bytecode,
-            max_constant=elide_constant_if_larger,
-        )
+        if output_file:
+            _dump_module(
+                module_op,
+                output_file,
+                binary_format=emit_bytecode,
+                max_constant=elide_constant_if_larger,
+            )
+
+    return module
 
 
 def _parse_args():

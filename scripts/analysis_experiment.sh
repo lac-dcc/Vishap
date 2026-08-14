@@ -5,15 +5,15 @@
 set -e
 source "$(dirname "${BASH_SOURCE[0]}")/env_check.sh"
 
-ROOT_DIR="$(dirname $(dirname "${BASH_SOURCE[0]}"))"
+root_dir="$(dirname $(dirname "${BASH_SOURCE[0]}"))"
 
 ######################### Arg parsing #########################
 
 # Default values
-FUNCTION_NAME="main"
-INPUT_DIR=""
-INPUT_DESC=""
-OUTPUT_DESC=""
+function_name="main"
+input_dir=""
+input_desc=""
+output_desc=""
 
 # Usage function
 usage() {
@@ -36,19 +36,19 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -d|--input-dir)
-      INPUT_DIR="$2"
+      input_dir="$2"
       shift 2
       ;;
     -f|--function)
-      FUNCTION_NAME="$2"
+      function_name="$2"
       shift 2
       ;;
     -i|--input)
-      INPUT_DESC="$2"
+      input_desc="$2"
       shift 2
       ;;
     -o|--output)
-      OUTPUT_DESC="$2"
+      output_desc="$2"
       shift 2
       ;;
     -h|--help)
@@ -62,23 +62,23 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Validate required arguments
-if [[ -z "$INPUT_DESC" ]]; then
+if [[ -z "$input_desc" ]]; then
   echo "Error: --input is required" >&2
   usage 1
 fi
 
-if [[ -z "$OUTPUT_DESC" ]]; then
+if [[ -z "$output_desc" ]]; then
   echo "Error: --output is required" >&2
   usage 1
 fi
 
-if [[ -z "$INPUT_DIR" ]]; then
+if [[ -z "$input_dir" ]]; then
   echo "Error: --input-dir is required" >&2
   usage 1
 fi
 
-if [[ ! -d "$INPUT_DIR" ]]; then
-  echo "Error: MLIR models directory does not exist: $INPUT_DIR" >&2
+if [[ ! -d "$input_dir" ]]; then
+  echo "Error: MLIR models directory does not exist: $input_dir" >&2
   exit 1
 fi
 
@@ -87,11 +87,11 @@ echo
 echo "*********************************************************************************"
 echo "Run models and compare results"
 echo "*********************************************************************************"
-RUN_SCRIPT="$ROOT_DIR/scripts/run.py"
-for mlir_file in "$INPUT_DIR"/*.{mlir,mlirbc}; do
+run_script="$root_dir/scripts/run.py"
+for mlir_file in "$input_dir"/*.{mlir,mlirbc}; do
   if [[ -f "$mlir_file" ]]; then
     echo "*************************$mlir_file*************************"
-    python $RUN_SCRIPT "$mlir_file" --input=$INPUT_DESC --output=$OUTPUT_DESC --function=$FUNCTION_NAME
+    python $run_script "$mlir_file" --input=$input_desc --output=$output_desc --function=$function_name
     echo
   fi
 done
