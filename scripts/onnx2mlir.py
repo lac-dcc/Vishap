@@ -66,13 +66,9 @@ def _dump_module(module, output_filename, binary_format=False, max_constant=None
         output_file.close()
 
 
-def prepare_onnx_model(model: str | onnx.ModelProto) -> onnx.ModelProto:
-    """Load (if needed), name unnamed nodes, and run shape inference."""
-    if isinstance(model, str):
-        raw_model = onnx.load(model)
-    else:
-        raw_model = model
-
+def load_onnx_model(model: str) -> onnx.ModelProto:
+    """Load, name unnamed nodes, and run shape inference."""
+    raw_model = onnx.load(model)
     # ONNX nodes don't strictly require names. If they are unnamed,
     # MLIR location tracking drops them. We force a name for every node.
     for i, node in enumerate(raw_model.graph.node):
@@ -107,7 +103,10 @@ def convert_onnx_to_mlir(
         The imported MLIR module.
     """
 
-    inferred_model = prepare_onnx_model(model)
+    if isinstance(model, str):
+        inferred_model = load_onnx_model(model)
+    else:
+        inferred_model = model
 
     with ir.Context() as ctx:
         torch_d.register_dialect(ctx)

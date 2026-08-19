@@ -26,7 +26,7 @@ from pathlib import Path
 # FIXME: use our own Python bindings
 from torch_mlir.ir import Module as TorchMlirModule
 
-from onnx2mlir import convert_onnx_to_mlir, prepare_onnx_model
+from onnx2mlir import convert_onnx_to_mlir, load_onnx_model
 from utils import (
     Stats,
     TMP_DIR,
@@ -365,7 +365,7 @@ def _vishap_quantization(
 
     start = time.perf_counter_ns()
     try:
-        onnx_model = prepare_onnx_model(input_model)
+        onnx_model = load_onnx_model(input_model)
         convert_onnx_to_mlir(onnx_model, output_file=output_mlir)
     except:
         # TODO: how to report errors on main?
