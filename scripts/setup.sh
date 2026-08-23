@@ -14,4 +14,5 @@ cmake -S . -B $build_dir -G "Ninja" \
     -DMLIR_DIR=${LLVM_BUILD_DIR}/lib/cmake/mlir   \
     -DCMAKE_C_COMPILER=$CC                        \
     -DCMAKE_CXX_COMPILER=$CXX                     \
+    -DPython3_EXECUTABLE=$(which python3)         \
     -DCMAKE_EXPORT_COMPILE_COMMANDS=ON .

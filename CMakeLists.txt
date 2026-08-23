@@ -5,6 +5,9 @@ project(Vishap LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Project libraries are embedded into the Python bindings' shared CAPI
+# library, so all objects must be position independent.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ------------------------------------------------------------------------------
 # MLIR / LLVM configuration
@@ -60,3 +63,25 @@ add_subdirectory(lib)
 add_subdirectory(tools)
 add_subdirectory(include)
 add_subdirectory(lit_tests)
+
+# ------------------------------------------------------------------------------
+# Python bindings
+# ------------------------------------------------------------------------------
+
+# Requires an MLIR build with MLIR_ENABLE_BINDINGS_PYTHON=ON and a Python
+# environment with the MLIR python dev dependencies (nanobind, numpy, etc.).
+if(MLIR_ENABLE_BINDINGS_PYTHON)
+  message(STATUS "Enabling Vishap Python bindings")
+  include(MLIRDetectPythonEnv)
+  mlir_configure_python_dev_packages()
+  if(NOT MLIR_PYTHON_PACKAGE_PREFIX)
+    set(MLIR_PYTHON_PACKAGE_PREFIX "vishap" CACHE STRING "" FORCE)
+  endif()
+  if(NOT MLIR_BINDINGS_PYTHON_NB_DOMAIN)
+    set(MLIR_BINDINGS_PYTHON_NB_DOMAIN "vishap" CACHE STRING "" FORCE)
+  endif()
+  if(NOT MLIR_BINDINGS_PYTHON_INSTALL_PREFIX)
+    set(MLIR_BINDINGS_PYTHON_INSTALL_PREFIX "python_packages/vishap/${MLIR_PYTHON_PACKAGE_PREFIX}" CACHE STRING "" FORCE)
+  endif()
+  add_subdirectory(python)
+endif()

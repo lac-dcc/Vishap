@@ -36,13 +36,19 @@ from torch_mlir.extras import onnx_importer
 from torch_mlir.dialects import torch as torch_d
 from torch_mlir.compiler_utils import run_pipeline_with_repro_report
 
-# This script uses MLIR Python bindings. To run it, you must have a LLVM build
-# with MLIR_ENABLE_BINDINGS_PYTHON enabled. You also need to update your
-# PYTHONPATH. More information here: https://mlir.llvm.org/docs/Bindings/Python/
-from mlir.ir import Module
+from utils import ensure_mlir_bindings_on_path
 
 logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+try:
+    ensure_mlir_bindings_on_path()
+    from mlir.ir import Module
+except:
+    logger.error(
+        "MLIR bindings are not available. Ensure you have an LLVM with MLIR_ENABLE_BINDINGS_PYTHON."
+    )
+    exit(1)
 
 
 def _dump_module(module, output_filename, binary_format=False, max_constant=None):
@@ -87,7 +93,7 @@ def convert_onnx_to_mlir(
     output_file: str = "",
     emit_bytecode: bool = False,
     elide_constant_if_larger: int = None,
-) -> Module:
+):
     """Convert ONNX model into an MLIR file, using mainly upstream dialects.
 
     Args:

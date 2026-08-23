@@ -1,5 +1,6 @@
 import argparse
 import csv
+import io
 import logging
 import numpy as np
 import onnx
@@ -20,23 +21,16 @@ from onnxruntime.quantization.calibrate import (
 )
 from pathlib import Path
 
-# The annotated file is in the stablehlo dialect, which is not part of
-# the upstream MLIR Python bindings. Parse it with the torch-mlir
-# bindings instead.
-# FIXME: use our own Python bindings
-from torch_mlir.ir import Module as TorchMlirModule
-
 from onnx2mlir import convert_onnx_to_mlir, load_onnx_model
 from utils import (
     Stats,
     TMP_DIR,
     VISHAP_DIST_ATTR,
+    annotate_distributions,
     get_array_stats,
     is_image_path,
     is_nchw_layout,
-    make_stablehlo_context,
     preprocess_image,
-    run_vishap,
     spatial_size,
 )
 
@@ -278,37 +272,56 @@ def _parse_onnx_loc_name(location: str) -> str:
 
 
 def _collect_vishap_dists(
-    dist_file: str, valid_onnx_names: set[str]
+    mlir_module, valid_onnx_names: set[str]
 ) -> tuple[dict[str, list[Stats]], list[Stats]]:
-    """Parse annotated MLIR and return (node_name -> output stats, entry output stats)."""
+    """Walk an annotated MLIR module and return (node_name -> output stats, entry output stats)."""
     onnx_name_to_dists: dict[str, list[Stats]] = {}
     entry_output_stats: list[Stats] = []
 
-    with make_stablehlo_context() as ctx:
-        module = TorchMlirModule.parseFile(dist_file, ctx)
+    # Assume entry function is the first operation in the module's body
+    entry_func = mlir_module.body.operations[0]
+    for op in entry_func.regions[0].blocks[0]:
+        if VISHAP_DIST_ATTR not in op.attributes:
+            continue
 
-        # Assume entry function is the first operation in the module's body
-        entry_func = module.body.operations[0]
-        for op in entry_func.body.blocks[0]:
-            if VISHAP_DIST_ATTR not in op.attributes:
-                continue
+        onnx_name = _parse_onnx_loc_name(str(op.location))
+        if onnx_name not in valid_onnx_names:
+            continue
 
-            onnx_name = _parse_onnx_loc_name(str(op.location))
-            if onnx_name not in valid_onnx_names:
-                continue
+        onnx_name_to_dists[onnx_name] = [
+            tuple(np.float64(val) for val in dist)
+            for dist in op.operation.attributes[VISHAP_DIST_ATTR]
+        ]
 
-            onnx_name_to_dists[onnx_name] = [
-                tuple(np.float64(val) for val in dist)
-                for dist in op.operation.attributes[VISHAP_DIST_ATTR]
-            ]
-
-        if VISHAP_DIST_ATTR in entry_func.attributes:
-            entry_output_stats = [
-                tuple(np.float64(val) for val in dist)
-                for dist in entry_func.operation.attributes[VISHAP_DIST_ATTR]
-            ]
+    if VISHAP_DIST_ATTR in entry_func.attributes:
+        entry_output_stats = [
+            tuple(np.float64(val) for val in dist)
+            for dist in entry_func.operation.attributes[VISHAP_DIST_ATTR]
+        ]
 
     return onnx_name_to_dists, entry_output_stats
+
+
+def _annotate_module_in_memory(mlir_module, input_stats: list[Stats]):
+    """Run annotate-distributions on a MLIR module via the Vishap bindings.
+
+    Raises:
+        ImportError: If the Vishap bindings are not built/importable.
+
+    Returns:
+        The annotated module, owned by the Vishap bindings.
+    """
+    buf = io.BytesIO()
+    mlir_module.operation.write_bytecode(file=buf)
+    try:
+        return annotate_distributions(buf.getvalue(), input_stats)
+    except ImportError:
+        logger.error(
+            "Unable to import Vishap Python bindings. Make sure to build Vishap with bindings enabled."
+        )
+        raise
+    except Exception:
+        raise
 
 
 def _build_tensor_quant_overrides(
@@ -358,15 +371,10 @@ def _vishap_quantization(
     seed: int | None = None,
     perf_out: str = "perf_info.csv",
 ):
-    output_mlir = QUANT_TMP_DIR / os.path.basename(input_model).replace(
-        ".onnx", ".mlir"
-    )
-    os.makedirs(QUANT_TMP_DIR, exist_ok=True)
-
     start = time.perf_counter_ns()
     try:
         onnx_model = load_onnx_model(input_model)
-        convert_onnx_to_mlir(onnx_model, output_file=output_mlir)
+        mlir_module = convert_onnx_to_mlir(onnx_model)
     except:
         # TODO: how to report errors on main?
         logger.error(f"Failed to load ONNX model {input_model}")
@@ -404,23 +412,18 @@ def _vishap_quantization(
         batches[0] if len(batches) == 1 else np.concatenate(batches, axis=0)
     )
 
+    valid_onnx_names = set(_get_onnx_node_names(onnx_model))
     try:
-        # TODO: enable python bindings
         # We assume one input tensor per model
-        dist_file = run_vishap(
-            output_mlir,
-            [input_stats],
-            QUANT_TMP_DIR,
+        annotated_module = _annotate_module_in_memory(mlir_module, [input_stats])
+        onnx_name_to_dists, entry_output_stats = _collect_vishap_dists(
+            annotated_module, valid_onnx_names
         )
     except Exception as e:
         logger.error("Vishap quantization failed")
         logger.error(e)
         return
 
-    valid_onnx_names = set(_get_onnx_node_names(onnx_model))
-    onnx_name_to_dists, entry_output_stats = _collect_vishap_dists(
-        dist_file, valid_onnx_names
-    )
     injected_stats = _build_tensor_quant_overrides(
         onnx_model,
         onnx_name_to_dists,

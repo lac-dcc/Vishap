@@ -1,13 +1,12 @@
 import numpy as np
 import os
+import sys
 from pathlib import Path
 from PIL import Image
-import subprocess
 
 Stats = tuple[np.float64, np.float64, np.float64, np.float64]
 ROOT_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
 BUILD_DIR = ROOT_DIR / "build"
-VISHAP_OPT = BUILD_DIR / "bin" / "vishap-opt"
 TMP_DIR = ROOT_DIR / "tmp"
 VISHAP_DIST_ATTR = "vishap.distribution"
 
@@ -41,18 +40,77 @@ def parse_io(io_desc: str) -> list[tuple[tuple[int, ...], np.dtype]]:
     return shapes_and_types
 
 
-def make_stablehlo_context():
-    """Create an MLIR context that can parse Vishap-annotated StableHLO files.
+def get_llvm_build_dir() -> str:
+    llvm_build_dir = os.getenv("LLVM_BUILD_DIR")
+    assert llvm_build_dir, "'LLVM_BUILD_DIR' env variable must be set"
+    assert os.path.exists(llvm_build_dir), f"{llvm_build_dir} is not a valid directory"
 
-    The upstream MLIR Python bindings do not include the (out-of-tree)
-    stablehlo dialect, so we rely on the bindings bundled with torch-mlir.
+    return Path(llvm_build_dir)
+
+
+def ensure_mlir_bindings_on_path():
     """
-    from torch_mlir import ir
-    from torch_mlir._mlir_libs import _stablehlo
+    Make the MLIR Python bindings importable. You must have a LLVM build
+    with MLIR_ENABLE_BINDINGS_PYTHON enabled. More information here:
+    https://mlir.llvm.org/docs/Bindings/Python/.
+    """
+    llvm_build_dir = get_llvm_build_dir()
+    path = str(llvm_build_dir / "tools" / "mlir" / "python_packages" / "mlir_core")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+
+def ensure_vishap_bindings_on_path():
+    """Make the Vishap Python bindings built under BUILD_DIR importable."""
+    path = str(BUILD_DIR / "python_packages" / "vishap")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+
+def make_vishap_context():
+    """Create an MLIR context with all the dialects needed by Vishap.
+
+    Raises:
+        ImportError: If the bindings are not built/importable.
+    """
+    ensure_vishap_bindings_on_path()
+    from vishap import ir
+    from vishap._mlir_libs import _vishap
 
     ctx = ir.Context()
-    _stablehlo.register_dialect(ctx)
+    _vishap.register_dialects(ctx)
     return ctx
+
+
+def annotate_distributions(module_asm: bytes | str, input_stats: list[Stats]):
+    """Run the annotate-distributions pass in-process via Python bindings.
+
+    Args:
+        module_asm: The module to annotate, as in-memory MLIR bytecode
+            (bytes) or textual assembly (str).
+        input_stats: Distribution stats for each entry function argument.
+
+    Raises:
+        ImportError: If the Vishap bindings are not built/importable.
+        Exception: May re-raise MLIR errors from parsing or the pass.
+
+    Returns:
+        The annotated MLIR module (a `vishap.ir.Module`, which keeps its
+        context alive).
+    """
+    ensure_vishap_bindings_on_path()
+    from vishap.ir import Module
+    from vishap.passmanager import PassManager
+
+    with make_vishap_context() as ctx:
+        module = Module.parse(module_asm)
+        pipeline = (
+            "builtin.module(func.func(annotate-distributions{"
+            + _stats_to_vishap_arg(input_stats)
+            + "}))"
+        )
+        PassManager.parse(pipeline).run(module.operation)
+    return module
 
 
 def get_array_stats(array: np.ndarray) -> Stats:
@@ -132,31 +190,3 @@ def _stats_to_vishap_arg(stats: list[Stats]) -> str:
     )
 
     return arg + input_dists
-
-
-def run_vishap(
-    input_model: str, input_stats: list[Stats], out_dir: Path = TMP_DIR
-) -> str:
-    os.makedirs(out_dir, exist_ok=True)
-
-    input_dists_arg = _stats_to_vishap_arg(input_stats)
-    out_file = out_dir / os.path.basename(input_model).replace(".mlir", ".dist.mlir")
-
-    # FIXME: Run this through Python bindings
-    args = [
-        VISHAP_OPT,
-        f"--annotate-distributions={input_dists_arg}",
-        "--mlir-print-debuginfo",
-        input_model,
-        "-o",
-        out_file,
-    ]
-    output = subprocess.run(args, capture_output=True)
-
-    if output.returncode != 0:
-        # print("Vishap failed with the following error:")
-        # print(output.stderr.decode())
-        command_str = " ".join(str(arg) for arg in args)
-        raise RuntimeError(f'Vishap execution failed. To reproduce run "{command_str}"')
-
-    return str(out_file)

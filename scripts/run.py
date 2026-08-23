@@ -1,42 +1,42 @@
 import argparse
 import csv
 import ctypes
+import logging
 import numpy as np
 import os
-import subprocess
 
-# This script uses MLIR Python bindings. To run it, you must have a LLVM build
-# with MLIR_ENABLE_BINDINGS_PYTHON enabled. You also need to update your
-# PYTHONPATH. More information here: https://mlir.llvm.org/docs/Bindings/Python/
-from mlir.execution_engine import ExecutionEngine
-from mlir.ir import Module, Context, UnitAttr
-from mlir.passmanager import PassManager
-from mlir.runtime import get_ranked_memref_descriptor, ranked_memref_to_numpy
 from pathlib import Path
-
-# The annotated file is in the stablehlo dialect, which is not part of
-# the upstream MLIR Python bindings. Parse it with the torch-mlir
-# bindings instead.
-from torch_mlir.ir import FloatType, RankedTensorType
-from torch_mlir.ir import Module as TorchMlirModule
-from torch_mlir.ir import WalkResult as TorchMlirWalkResult
-
 from utils import (
     Stats,
     TMP_DIR,
-    VISHAP_OPT,
     BUILD_DIR,
+    annotate_distributions,
+    ensure_vishap_bindings_on_path,
     get_array_stats,
+    get_llvm_build_dir,
     load_input_array,
     parse_io,
-    run_vishap,
-    make_stablehlo_context,
 )
+
+logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+try:
+    ensure_vishap_bindings_on_path()
+    from vishap.execution_engine import ExecutionEngine
+    from vishap.ir import UnitAttr, RankedTensorType, FloatType, WalkResult
+    from vishap.passmanager import PassManager
+    from vishap.runtime import get_ranked_memref_descriptor, ranked_memref_to_numpy
+except ImportError:
+    logger.error(
+        "Vishap bindings are not available. Ensure you have built Vishap with MLIR_ENABLE_BINDINGS_PYTHON."
+    )
+    exit(1)
 
 VISHAP_TMP_DIR = TMP_DIR / "vishap"
 
 
-def _parse_network_to_llvm(ctx: Context, filename: str) -> Module:
+def _parse_network_to_llvm(module):
     STABLEHLO_TO_LLVM_PIPELINE = """builtin.module(            \
         func.func(                                             \
             add-probe-calls,                                   \
@@ -69,27 +69,7 @@ def _parse_network_to_llvm(ctx: Context, filename: str) -> Module:
         )                                                      \
     )"""
 
-    assert os.path.exists(filename), f"{filename} is not a valid file"
-
-    probe_file = VISHAP_TMP_DIR / os.path.basename(filename).replace(
-        ".mlir", ".probe.mlir"
-    )
-
-    args = [
-        VISHAP_OPT,
-        filename,
-        f"--pass-pipeline={STABLEHLO_TO_LLVM_PIPELINE}",
-        "-o",
-        probe_file,
-    ]
-    output = subprocess.run(args, capture_output=True)
-    if output.returncode != 0:
-        print("Vishap failed with the following error:")
-        print(output.stderr.decode())
-        command_str = " ".join([str(arg) for arg in args])
-        raise RuntimeError(f'Vishap execution failed. To reproduce run "{command_str}"')
-
-    module = Module.parseFile(str(probe_file), ctx)
+    PassManager.parse(STABLEHLO_TO_LLVM_PIPELINE).run(module.operation)
     entry_func = module.body.operations[0]
     entry_func.operation.attributes["llvm.emit_c_interface"] = UnitAttr.get()
 
@@ -136,26 +116,21 @@ def _create_io_memref_ptrs(io_arrays: list[np.ndarray]):
 
 
 def _run_network(
-    input_file: str,
+    annotated_module,
     input_arrays: list[np.ndarray],
     output_arrays: list[np.ndarray],
     function: str,
 ) -> list[Stats]:
-    llvm_build_dir = os.getenv("LLVM_BUILD_DIR")
-    assert llvm_build_dir, "'LLVM_BUILD_DIR' env variable must be set"
-    assert os.path.exists(llvm_build_dir), f"{llvm_build_dir} is not a valid directory"
-
-    llvm_build_path = Path(llvm_build_dir)
+    llvm_build_dir = get_llvm_build_dir()
     MLIR_SHARED_LIBS = [
-        str(llvm_build_path / "lib/libmlir_runner_utils.so"),
-        str(llvm_build_path / "lib/libmlir_c_runner_utils.so"),
+        str(llvm_build_dir / "lib/libmlir_runner_utils.so"),
+        str(llvm_build_dir / "lib/libmlir_c_runner_utils.so"),
         str(BUILD_DIR / "lib/Runtime/libVishapRuntime.so"),
     ]
 
-    with Context() as ctx:
-        module = _parse_network_to_llvm(ctx, input_file)
-        engine = ExecutionEngine(module, opt_level=3, shared_libs=MLIR_SHARED_LIBS)
-
+    with annotated_module.context:
+        llvm_module = _parse_network_to_llvm(annotated_module)
+        engine = ExecutionEngine(llvm_module, opt_level=3, shared_libs=MLIR_SHARED_LIBS)
     input_memref_ptrs = _create_io_memref_ptrs(input_arrays)
     output_memref_ptrs = _create_io_memref_ptrs(output_arrays)
     engine.invoke(
@@ -253,38 +228,41 @@ def _is_float_ranked_tensor_type(type_) -> bool:
     )
 
 
-def _compare_results(vishap_out_file: str):
-    # Collect distribution estimations from Vishap
-    with make_stablehlo_context() as ctx:
-        ctx.allow_unregistered_dialects = True
-        module = TorchMlirModule.parseFile(vishap_out_file, ctx)
-        entry_func = module.body.operations[0]
+def _collect_vishap_estimations(annotated_module) -> tuple[list[str], list[Stats]]:
+    """Collect Vishap distribution estimations from MLIR module"""
+    entry_func = annotated_module.body.operations[0]
 
-        op_names = []
-        estimated_dists = []
-        vishap_dist_attr = "vishap.distribution"
+    op_names = []
+    estimated_dists = []
+    vishap_dist_attr = "vishap.distribution"
 
-        def collect_dists(op):
-            if vishap_dist_attr not in op.attributes:
-                return TorchMlirWalkResult.ADVANCE
+    def collect_dists(op):
+        if vishap_dist_attr not in op.attributes:
+            return WalkResult.ADVANCE
 
-            dists = list(op.operation.attributes[vishap_dist_attr])
-            results = list(op.results)
-            # Mirror AddProbeCalls: one observation per float ranked-tensor
-            # result. Skips func.func (no results) and non-float results such
-            # as the i64 constant retroactively annotated from convert.
-            if len(dists) != len(results):
-                return TorchMlirWalkResult.ADVANCE
+        dists = list(op.operation.attributes[vishap_dist_attr])
+        results = list(op.results)
+        # Mirror AddProbeCalls: one observation per float ranked-tensor
+        # result. Skips func.func (no results) and non-float results such
+        # as the i64 constant retroactively annotated from convert.
+        if len(dists) != len(results):
+            return WalkResult.ADVANCE
 
-            for dist, result in zip(dists, results):
-                if not _is_float_ranked_tensor_type(result.type):
-                    continue
-                op_names.append(op.operation.name)
-                estimated_dists.append(tuple(np.float64(val) for val in dist))
-            return TorchMlirWalkResult.ADVANCE
+        for dist, result in zip(dists, results):
+            if not _is_float_ranked_tensor_type(result.type):
+                continue
+            op_names.append(op.operation.name)
+            estimated_dists.append(tuple(np.float64(val) for val in dist))
+        return WalkResult.ADVANCE
 
-        entry_func.operation.walk(collect_dists)
+    entry_func.operation.walk(collect_dists)
 
+    return op_names, estimated_dists
+
+
+def _compare_results(
+    op_names: list[str], estimated_dists: list[Stats], csv_filename: str
+):
     # Collect true distributions from probe report
     true_dists = []
     # FIXME: Should this file name be hardcoded?
@@ -313,7 +291,6 @@ def _compare_results(vishap_out_file: str):
         )
         results.append((op_name, min_mape, max_mape, mean_mape, var_ratio))
 
-    csv_filename = Path(vishap_out_file).with_suffix(".csv").name
     _output_csv_results(csv_filename, results)
 
 
@@ -363,14 +340,23 @@ def _main():
     for idx, arr in enumerate(input_arrays):
         inputs_dir = VISHAP_TMP_DIR / "inputs"
         os.makedirs(inputs_dir, exist_ok=True)
-        out_path = inputs_dir / os.path.basename(args.input_model).replace(
-            ".mlir", f".input{idx}.npy"
+        out_path = (
+            inputs_dir / Path(args.input_model).with_suffix(f".input{idx}.npy").name
         )
         np.save(out_path, arr)
 
-    vishap_out_file = run_vishap(args.input_model, input_stats)
-    _run_network(vishap_out_file, input_arrays, output_arrays, args.function)
-    _compare_results(vishap_out_file)
+    # Run Vishap and collect estimations
+    with open(args.input_model, "rb") as f:
+        input_asm = f.read()
+    annotated_module = annotate_distributions(input_asm, input_stats)
+    op_names, estimated_dists = _collect_vishap_estimations(annotated_module)
+
+    # Run network and collect real distributions with probe
+    _run_network(annotated_module, input_arrays, output_arrays, args.function)
+
+    # Compare and report results
+    results_filename = Path(args.input_model).with_suffix(".csv").name
+    _compare_results(op_names, estimated_dists, results_filename)
 
 
 if __name__ == "__main__":
