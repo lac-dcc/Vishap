@@ -6,5 +6,6 @@ add_mlir_library(VishapTransforms
   VishapTransformsPassIncGen
 
   LINK_LIBS PUBLIC
+  MLIRArithDialect
   VishapAnalysis
   )
