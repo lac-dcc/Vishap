@@ -1,8 +1,10 @@
 #include "Analysis/DistributionAnalysis.h"
 #include "Dialect/Probe/IR/Probe.h"
 #include "Transforms/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "stablehlo/dialect/StablehloOps.h"
 #include <cstdint>
 
 namespace mlir::vishap {
@@ -10,6 +12,19 @@ namespace mlir::vishap {
 #include "Transforms/Passes.h.inc"
 
 namespace {
+bool isConstantLikeOp(Operation *op) {
+  return llvm::isa<stablehlo::ConstantOp, arith::ConstantOp>(op);
+}
+
+bool hasFloatRankedTensorResult(Operation *op) {
+  for (Value result : op->getResults()) {
+    auto tensorType = llvm::dyn_cast<RankedTensorType>(result.getType());
+    if (tensorType && tensorType.getElementType().isFloat())
+      return true;
+  }
+  return false;
+}
+
 class AddProbeCallsPass
     : public impl::AddProbeCallsPassBase<AddProbeCallsPass> {
 public:
@@ -19,10 +34,18 @@ public:
     auto funcOp = getOperation();
     std::vector<Operation *> worklist;
     funcOp.walk([&](Operation *op) {
-      // Only consider ops with vishap distribution attribute
-      if (op->hasAttr(kDistributionAttrName)) {
-        worklist.push_back(op);
+      // Skip ops inside regions (reduce_window / reduce / etc.).
+      if (op->getParentOp() != funcOp)
+        return;
+      if (allFloatOps) {
+        // If requested, add probe calls for all available float ops
+        if (!isConstantLikeOp(op) && hasFloatRankedTensorResult(op))
+          worklist.push_back(op);
+        return;
       }
+      // Default to only consider ops with vishap distribution attribute
+      if (op->hasAttr(kDistributionAttrName))
+        worklist.push_back(op);
     });
 
     auto *ctx = &getContext();

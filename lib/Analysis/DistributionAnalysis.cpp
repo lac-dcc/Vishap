@@ -173,6 +173,36 @@ computeConvertedConstantDistribution(DenseElementsAttr denseAttr,
   // Treat other float types (e.g., f16) as unsupported
   return failure();
 }
+
+/// Convert \p arrayAttr to a Distribution struct. Emit an error and return
+/// failure if the attribute is not well-formed.
+inline FailureOr<Distribution> arrayAttrToDistribution(Location loc,
+                                                       Attribute attr) {
+  auto arrayAttr = llvm::dyn_cast<ArrayAttr>(attr);
+  if (!arrayAttr) {
+    return mlir::emitError(loc) << "Invalid attribute. Expected ArrayAttr";
+  }
+
+  if (arrayAttr.size() != 4) {
+    mlir::emitError(loc)
+        << "Expected array attribute of size 4 for distribution info, got "
+        << arrayAttr.size();
+    return failure();
+  }
+
+  if (llvm::any_of(arrayAttr,
+                   [](auto attr) { return !llvm::isa<FloatAttr>(attr); })) {
+    return mlir::emitError(loc) << "Expected float type for all values in "
+                                   "distribution attribute";
+  }
+
+  return Distribution{
+      .min = llvm::cast<FloatAttr>(arrayAttr[0]).getValueAsDouble(),
+      .max = llvm::cast<FloatAttr>(arrayAttr[1]).getValueAsDouble(),
+      .mean = llvm::cast<FloatAttr>(arrayAttr[2]).getValueAsDouble(),
+      .variance = llvm::cast<FloatAttr>(arrayAttr[3]).getValueAsDouble(),
+  };
+}
 } // namespace
 
 /// Convert \p distribution to an array attribute that can be attached to an
@@ -847,7 +877,32 @@ DistributionAnalysis::visitConvert(stablehlo::ConvertOp convertOp) {
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitPreloadedOperation(Operation *op) {
+  // If the operation already has distribution annotations, collect them and
+  // add to the distribution map.
+
+  auto distAttr = op->getAttrOfType<ArrayAttr>(kDistributionAttrName);
+  if (!distAttr || distAttr.size() != op->getNumResults()) {
+    return op->emitError() << "Invalid " << kDistributionAttrName << " attribute";
+  }
+
+  for (size_t i = 0; i < distAttr.size(); i++) {
+    auto distOrFailure = arrayAttrToDistribution(op->getLoc(), distAttr[i]);
+    if (failed(distOrFailure)) {
+      return failure();
+    }
+
+    this->distributionMap[op->getResult(i)] = *distOrFailure;
+  }
+
+  return success();
+}
+
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
+  if (op->hasAttr(kDistributionAttrName)) {
+    return visitPreloadedOperation(op);
+  }
+
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
       .Case<stablehlo::ConstantOp>([&](stablehlo::ConstantOp constOp) {
         return visitConstantLikeOp(constOp, constOp.getValue());
@@ -913,32 +968,6 @@ DistributionAnalysis::getDistribution(Value value) {
   return &it->second;
 }
 
-/// Convert \p arrayAttr to a Distribution struct. Emit an error and return
-/// failure if the attribute is not well-formed.
-FailureOr<Distribution> arrayAttrToDistribution(Location loc,
-                                                ArrayAttr arrayAttr) {
-  if (arrayAttr.size() != 4) {
-    mlir::emitError(loc)
-        << "Expected array attribute of size 4 for distribution info, got "
-        << arrayAttr.size();
-    return failure();
-  }
-
-  for (auto attr : arrayAttr) {
-    if (!llvm::isa<FloatAttr>(attr)) {
-      return mlir::emitError(loc) << "Expected float type for all values in "
-                                     "distribution attribute";
-    }
-  }
-
-  return Distribution{
-      .min = llvm::cast<FloatAttr>(arrayAttr[0]).getValueAsDouble(),
-      .max = llvm::cast<FloatAttr>(arrayAttr[1]).getValueAsDouble(),
-      .mean = llvm::cast<FloatAttr>(arrayAttr[2]).getValueAsDouble(),
-      .variance = llvm::cast<FloatAttr>(arrayAttr[3]).getValueAsDouble(),
-  };
-}
-
 LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
   auto distAttr = func->getAttrOfType<ArrayAttr>(kArgsDistributionAttrName);
   if (!distAttr) {
@@ -955,9 +984,7 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
   }
 
   for (size_t i = 0; i < distAttr.size(); i++) {
-    auto operandDistAttr = llvm::cast<ArrayAttr>(distAttr[i]);
-    auto distOrFailure =
-        arrayAttrToDistribution(func.getLoc(), operandDistAttr);
+    auto distOrFailure = arrayAttrToDistribution(func.getLoc(), distAttr[i]);
     if (failed(distOrFailure)) {
       return failure();
     }

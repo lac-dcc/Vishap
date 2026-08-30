@@ -72,6 +72,8 @@ private:
 
   LogicalResult visitConvert(stablehlo::ConvertOp convertOp);
 
+  LogicalResult visitPreloadedOperation(Operation *op);
+
   LogicalResult visitOperation(Operation *op);
 
   /// Get distributions for function args, if available.

@@ -1,19 +1,17 @@
 import argparse
 import csv
-import ctypes
 import logging
 import numpy as np
 import os
 
 from pathlib import Path
+from mlir_runtime import run_probed_network, is_float_ranked_tensor_type
 from utils import (
     Stats,
     TMP_DIR,
-    BUILD_DIR,
     annotate_distributions,
     ensure_vishap_bindings_on_path,
     get_array_stats,
-    get_llvm_build_dir,
     load_input_array,
     parse_io,
 )
@@ -23,10 +21,7 @@ logger = logging.getLogger(__name__)
 
 try:
     ensure_vishap_bindings_on_path()
-    from vishap.execution_engine import ExecutionEngine
-    from vishap.ir import UnitAttr, RankedTensorType, FloatType, WalkResult
-    from vishap.passmanager import PassManager
-    from vishap.runtime import get_ranked_memref_descriptor, ranked_memref_to_numpy
+    from vishap.ir import WalkResult
 except ImportError:
     logger.error(
         "Vishap bindings are not available. Ensure you have built Vishap with MLIR_ENABLE_BINDINGS_PYTHON."
@@ -34,46 +29,6 @@ except ImportError:
     exit(1)
 
 VISHAP_TMP_DIR = TMP_DIR / "vishap"
-
-
-def _parse_network_to_llvm(module):
-    STABLEHLO_TO_LLVM_PIPELINE = """builtin.module(            \
-        func.func(                                             \
-            add-probe-calls,                                   \
-            canonicalize,                                      \
-            cse                                                \
-        ),                                                     \
-        stablehlo-convert-to-signless,                         \
-        func.func(stablehlo-legalize-to-linalg),               \
-        empty-tensor-to-alloc-tensor,                          \
-        one-shot-bufferize{bufferize-function-boundaries},     \
-        probe-lower-to-func-calls,                             \
-        convert-linalg-to-loops,                               \
-        convert-scf-to-cf,                                     \
-        expand-strided-metadata,                               \
-        lower-affine,                                          \
-        finalize-memref-to-llvm,                               \
-        convert-math-to-llvm,                                  \
-        convert-math-to-libm,                                  \
-        convert-arith-to-llvm,                                 \
-        convert-index-to-llvm,                                 \
-        convert-cf-to-llvm,                                    \
-        func.func(                                             \
-            llvm-request-c-wrappers                            \
-        ),                                                     \
-        convert-func-to-llvm,                                  \
-        reconcile-unrealized-casts,                            \
-        func.func(                                             \
-            canonicalize,                                      \
-            cse                                                \
-        )                                                      \
-    )"""
-
-    PassManager.parse(STABLEHLO_TO_LLVM_PIPELINE).run(module.operation)
-    entry_func = module.body.operations[0]
-    entry_func.operation.attributes["llvm.emit_c_interface"] = UnitAttr.get()
-
-    return module
 
 
 def _init_input(shape: tuple[int], dtype: np.dtype) -> np.ndarray:
@@ -87,10 +42,6 @@ def _init_input(shape: tuple[int], dtype: np.dtype) -> np.ndarray:
 def _init_output(shape: tuple[int], dtype: np.dtype) -> np.ndarray:
     out_arr = np.zeros(shape, dtype=dtype)
     return out_arr
-
-
-def _array_to_ranked_memref_ptr(array: np.ndarray):
-    return ctypes.pointer(ctypes.pointer(get_ranked_memref_descriptor(array)))
 
 
 def _create_io_arrays(
@@ -111,40 +62,19 @@ def _create_io_arrays(
     return tensors
 
 
-def _create_io_memref_ptrs(io_arrays: list[np.ndarray]):
-    return [_array_to_ranked_memref_ptr(arr) for arr in io_arrays]
-
-
 def _run_network(
     annotated_module,
     input_arrays: list[np.ndarray],
     output_arrays: list[np.ndarray],
     function: str,
 ) -> list[Stats]:
-    llvm_build_dir = get_llvm_build_dir()
-    MLIR_SHARED_LIBS = [
-        str(llvm_build_dir / "lib/libmlir_runner_utils.so"),
-        str(llvm_build_dir / "lib/libmlir_c_runner_utils.so"),
-        str(BUILD_DIR / "lib/Runtime/libVishapRuntime.so"),
-    ]
-
-    with annotated_module.context:
-        llvm_module = _parse_network_to_llvm(annotated_module)
-        engine = ExecutionEngine(llvm_module, opt_level=3, shared_libs=MLIR_SHARED_LIBS)
-    input_memref_ptrs = _create_io_memref_ptrs(input_arrays)
-    output_memref_ptrs = _create_io_memref_ptrs(output_arrays)
-    engine.invoke(
+    return run_probed_network(
+        annotated_module,
+        input_arrays,
+        output_arrays,
         function,
-        *output_memref_ptrs,
-        *input_memref_ptrs,
+        all_float_ops=False,
     )
-
-    output_stats = [
-        get_array_stats(ranked_memref_to_numpy(ptr[0]).astype(np.float32))
-        for ptr in output_memref_ptrs
-    ]
-
-    return output_stats
 
 
 def _compute_mape(actual: np.float64, estimate: np.float64) -> np.float64:
@@ -221,13 +151,6 @@ def _output_csv_results(
         writer.writerows(results)
 
 
-def _is_float_ranked_tensor_type(type_) -> bool:
-    """Identify float tensors. Only float tensors are observed by probe."""
-    return isinstance(type_, RankedTensorType) and isinstance(
-        type_.element_type, FloatType
-    )
-
-
 def _collect_vishap_estimations(annotated_module) -> tuple[list[str], list[Stats]]:
     """Collect Vishap distribution estimations from MLIR module"""
     entry_func = annotated_module.body.operations[0]
@@ -249,7 +172,7 @@ def _collect_vishap_estimations(annotated_module) -> tuple[list[str], list[Stats
             return WalkResult.ADVANCE
 
         for dist, result in zip(dists, results):
-            if not _is_float_ranked_tensor_type(result.type):
+            if not is_float_ranked_tensor_type(result.type):
                 continue
             op_names.append(op.operation.name)
             estimated_dists.append(tuple(np.float64(val) for val in dist))

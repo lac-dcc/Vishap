@@ -82,6 +82,40 @@ def make_vishap_context():
     return ctx
 
 
+def parse_vishap_module(module_asm: bytes | str):
+    """Parse MLIR bytecode or assembly into a Vishap-context module.
+
+    Returns:
+        A `vishap.ir.Module` that keeps its context alive.
+
+    Raises:
+        ImportError: If the bindings are not built/importable.
+    """
+    ensure_vishap_bindings_on_path()
+    from vishap.ir import Module
+
+    with make_vishap_context() as ctx:
+        return Module.parse(module_asm)
+
+
+def annotate_distributions_on_module(module, input_stats: list[Stats]):
+    """Run annotate-distributions in-place on an already-parsed module.
+    
+    Raises:
+        ImportError: If the bindings are not built/importable.
+    """
+    ensure_vishap_bindings_on_path()
+    from vishap.passmanager import PassManager
+
+    pipeline = (
+        "builtin.module(func.func(annotate-distributions{"
+        + _stats_to_vishap_arg(input_stats)
+        + "}))"
+    )
+    with module.context:
+        PassManager.parse(pipeline).run(module.operation)
+
+
 def annotate_distributions(module_asm: bytes | str, input_stats: list[Stats]):
     """Run the annotate-distributions pass in-process via Python bindings.
 
@@ -98,18 +132,8 @@ def annotate_distributions(module_asm: bytes | str, input_stats: list[Stats]):
         The annotated MLIR module (a `vishap.ir.Module`, which keeps its
         context alive).
     """
-    ensure_vishap_bindings_on_path()
-    from vishap.ir import Module
-    from vishap.passmanager import PassManager
-
-    with make_vishap_context() as ctx:
-        module = Module.parse(module_asm)
-        pipeline = (
-            "builtin.module(func.func(annotate-distributions{"
-            + _stats_to_vishap_arg(input_stats)
-            + "}))"
-        )
-        PassManager.parse(pipeline).run(module.operation)
+    module = parse_vishap_module(module_asm)
+    annotate_distributions_on_module(module, input_stats)
     return module
 
 

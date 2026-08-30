@@ -86,6 +86,9 @@ quantize_script="$root_dir/scripts/ort_quantize.py"
 quant_methods=(
   "vishap|--method vishap --input-file ${input_image} --seed ${seed}"
   "vishap_agg|--method vishap --input-dir ${image_dir} --num-inputs ${num_images} --seed ${seed}"
+  "mixed_0.25|--method mixed --input-file ${input_image} --preload-ratio 0.25 --seed ${seed}"
+  "mixed_0.50|--method mixed --input-file ${input_image} --preload-ratio 0.5 --seed ${seed}"
+  "mixed_0.75|--method mixed --input-file ${input_image} --preload-ratio 0.75 --seed ${seed}"
   "calibration|--method calibration --input-dir ${image_dir} --seed ${seed}"
   "random|--method random --seed ${seed}"
 )

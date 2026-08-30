@@ -27,9 +27,11 @@ from utils import (
     TMP_DIR,
     VISHAP_DIST_ATTR,
     annotate_distributions,
+    annotate_distributions_on_module,
     get_array_stats,
     is_image_path,
     is_nchw_layout,
+    parse_vishap_module,
     preprocess_image,
     spatial_size,
 )
@@ -113,6 +115,7 @@ class RealDataCalibrationReader(CalibrationDataReader):
 class QuantMethod(Enum):
     calibration = "calibration"
     vishap = "vishap"
+    mixed = "mixed"
     random = "random"
 
     def __str__(self):
@@ -361,6 +364,48 @@ def _build_tensor_quant_overrides(
     return injected_stats
 
 
+def _load_onnx_and_mlir(input_model: str):
+    try:
+        onnx_model = load_onnx_model(input_model)
+        mlir_module = convert_onnx_to_mlir(onnx_model)
+        return onnx_model, mlir_module
+    except Exception:
+        logger.error(f"Failed to load ONNX model {input_model}")
+        return None, None
+
+
+def _quantize_with_vishap_dists(
+    input_model: str,
+    output_model: str,
+    onnx_model: onnx.ModelProto,
+    annotated_module,
+    input_stats: Stats,
+    lambd: int,
+):
+    valid_onnx_names = set(_get_onnx_node_names(onnx_model))
+    onnx_name_to_dists, entry_output_stats = _collect_vishap_dists(
+        annotated_module, valid_onnx_names
+    )
+    injected_stats = _build_tensor_quant_overrides(
+        onnx_model,
+        onnx_name_to_dists,
+        entry_output_stats,
+        input_stats,
+        lambd,
+    )
+    extra_options = {"TensorQuantOverrides": injected_stats}
+    quantize_static(
+        model_input=input_model,
+        model_output=output_model,
+        calibration_data_reader=SmartDummyDataReader(input_model),
+        calibrate_method=CalibrationMethod.MinMax,
+        activation_type=QuantType.QUInt8,
+        weight_type=QuantType.QInt8,
+        # Override quantization parameters with Vishap estimations
+        extra_options=extra_options,
+    )
+
+
 def _vishap_quantization(
     input_model: str,
     output_model: str,
@@ -372,12 +417,8 @@ def _vishap_quantization(
     perf_out: str = "perf_info.csv",
 ):
     start = time.perf_counter_ns()
-    try:
-        onnx_model = load_onnx_model(input_model)
-        mlir_module = convert_onnx_to_mlir(onnx_model)
-    except:
-        # TODO: how to report errors on main?
-        logger.error(f"Failed to load ONNX model {input_model}")
+    onnx_model, mlir_module = _load_onnx_and_mlir(input_model)
+    if onnx_model is None or mlir_module is None:
         return
 
     if input_file:
@@ -412,40 +453,115 @@ def _vishap_quantization(
         batches[0] if len(batches) == 1 else np.concatenate(batches, axis=0)
     )
 
-    valid_onnx_names = set(_get_onnx_node_names(onnx_model))
     try:
         # We assume one input tensor per model
         annotated_module = _annotate_module_in_memory(mlir_module, [input_stats])
-        onnx_name_to_dists, entry_output_stats = _collect_vishap_dists(
-            annotated_module, valid_onnx_names
-        )
     except Exception as e:
         logger.error("Vishap quantization failed")
         logger.error(e)
         return
 
-    injected_stats = _build_tensor_quant_overrides(
-        onnx_model,
-        onnx_name_to_dists,
-        entry_output_stats,
-        input_stats,
-        lambd,
+    _quantize_with_vishap_dists(
+        input_model, output_model, onnx_model, annotated_module, input_stats, lambd
     )
 
-    extra_options = {"TensorQuantOverrides": injected_stats}
-    quantize_static(
-        model_input=input_model,
-        model_output=output_model,
-        calibration_data_reader=SmartDummyDataReader(input_model),
-        calibrate_method=CalibrationMethod.MinMax,
-        activation_type=QuantType.QUInt8,
-        weight_type=QuantType.QInt8,
-        # Override quantization parameters with Vishap estimations
-        extra_options=extra_options,
-    )
     end = time.perf_counter_ns()
     perf_method = "vishap_agg" if num_inputs > 1 else "vishap"
     _save_perf_info(perf_out, (end - start) / 1_000_000, perf_method)
+
+
+def _module_bytecode(mlir_module) -> bytes:
+    buf = io.BytesIO()
+    mlir_module.operation.write_bytecode(file=buf)
+    return buf.getvalue()
+
+
+def _mixed_quantization(
+    input_model: str,
+    output_model: str,
+    input_file: str | None = None,
+    input_dir: str | None = None,
+    lambd: int = 5,
+    preload_ratio: float = 0.5,
+    seed: int | None = None,
+    perf_out: str = "perf_info.csv",
+):
+    from mlir_runtime import (
+        attach_probe_dists_to_ops,
+        collect_all_float_probe_targets,
+        io_arrays_from_entry_func,
+        parse_probe_report,
+        run_probed_network,
+    )
+
+    start = time.perf_counter_ns()
+    onnx_model, mlir_module = _load_onnx_and_mlir(input_model)
+    if onnx_model is None:
+        return
+
+    if input_file:
+        input_source = input_file
+    elif input_dir:
+        input_source = input_dir
+    else:
+        logger.error("Mixed quantization requires --input-file or --input-dir")
+        return None
+
+    batches = load_inputs_for_model(input_model, input_source, max_images=1, seed=seed)
+    if not batches or batches[0] is None:
+        logger.error(f"No inputs loaded from {input_source}")
+        return None
+
+    input_stats = get_array_stats(batches[0])
+    bytecode = _module_bytecode(mlir_module)
+
+    try:
+        probe_module = parse_vishap_module(bytecode)
+        targets = collect_all_float_probe_targets(probe_module)
+        func = probe_module.body.operations[0]
+        func_name = func.attributes["sym_name"].value
+        input_arrays, output_arrays = io_arrays_from_entry_func(
+            probe_module, [batches[0]]
+        )
+        logger.info(
+            "Running probed network (%d float ops) to collect telemetry",
+            len(targets),
+        )
+        run_probed_network(
+            probe_module,
+            input_arrays,
+            output_arrays,
+            func_name,
+            all_float_ops=True,
+        )
+        probe_dists = parse_probe_report()
+
+        mixed_module = parse_vishap_module(bytecode)
+        n_preloaded = attach_probe_dists_to_ops(
+            mixed_module, targets, probe_dists, preload_ratio, seed
+        )
+        logger.info("Preloaded probe distributions on %d ops", n_preloaded)
+        annotate_distributions_on_module(mixed_module, [input_stats])
+        _quantize_with_vishap_dists(
+            input_model,
+            output_model,
+            onnx_model,
+            mixed_module,
+            input_stats,
+            lambd,
+        )
+    except ImportError:
+        logger.error(
+            "Unable to import Vishap Python bindings. Make sure to build Vishap with bindings enabled."
+        )
+        return
+    except Exception as e:
+        logger.error("Mixed quantization failed")
+        logger.error(e)
+        return
+
+    end = time.perf_counter_ns()
+    _save_perf_info(perf_out, (end - start) / 1_000_000, f"mixed_{preload_ratio:.2f}")
 
 
 def _calibration_quantization(
@@ -565,12 +681,22 @@ def _parse_args():
         ),
     )
     parser.add_argument(
+        "--preload-ratio",
+        dest="preload_ratio",
+        type=float,
+        default=None,
+        help=(
+            "fraction of non-constant float ops to preload with probe telemetry "
+            "for mixed quantization (required for --method mixed, in [0, 1])"
+        ),
+    )
+    parser.add_argument(
         "--seed",
         dest="seed",
         type=int,
         default=0,
         help=(
-            "RNG seed for input sampling and random quantization "
+            "RNG seed for input sampling, mixed op selection, and random quantization "
             "(default: %(default)s)"
         ),
     )
@@ -616,6 +742,28 @@ def _main():
                 args.input_dir,
                 args.lambd,
                 args.num_inputs,
+                args.seed,
+                args.perf_out,
+            )
+        case QuantMethod.mixed:
+            if args.preload_ratio is None:
+                logger.error("Mixed quantization requires --preload-ratio")
+                return 1
+            if not 0.0 <= args.preload_ratio <= 1.0:
+                logger.error("--preload-ratio must be in [0, 1]")
+                return 1
+            if args.num_inputs > 1:
+                logger.error(
+                    "Mixed quantization uses a single input; do not set --num-inputs > 1"
+                )
+                return 1
+            _mixed_quantization(
+                args.input_model,
+                args.output_model,
+                args.input_file,
+                args.input_dir,
+                args.lambd,
+                args.preload_ratio,
                 args.seed,
                 args.perf_out,
             )
