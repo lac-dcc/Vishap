@@ -100,7 +100,7 @@ def parse_vishap_module(module_asm: bytes | str):
 
 def annotate_distributions_on_module(module, input_stats: list[Stats]):
     """Run annotate-distributions in-place on an already-parsed module.
-    
+
     Raises:
         ImportError: If the bindings are not built/importable.
     """
@@ -214,3 +214,26 @@ def _stats_to_vishap_arg(stats: list[Stats]) -> str:
     )
 
     return arg + input_dists
+
+
+def collect_input_paths(input_path: str | Path) -> list[Path]:
+    """Return image/.npy paths from a file or recursively from a directory."""
+    path = Path(input_path)
+    if path.is_file():
+        if is_image_path(path) or path.suffix.lower() == ".npy":
+            return [path]
+        raise ValueError(
+            f"Unsupported input file type: {path.suffix} (expected image or .npy)"
+        )
+    if not path.is_dir():
+        raise FileNotFoundError(f"Input path does not exist: {path}")
+
+    images = sorted(p for p in path.rglob("*") if p.is_file() and is_image_path(p))
+    if images:
+        return images
+
+    npy_files = sorted(path.glob("*.npy"))
+    if npy_files:
+        return npy_files
+
+    raise FileNotFoundError(f"No images or .npy files found under {path}")
