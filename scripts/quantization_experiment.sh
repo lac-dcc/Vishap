@@ -21,7 +21,7 @@ Required arguments:
   -d, --input-dir <dir>       Directory containing input ONNX files
 
 Optional arguments:
-  -s, --seed <int>            RNG seed for quantization (default: 0)
+  -s, --seed <int>            RNG seed for quantization (default: 42)
   -h, --help                  Display this help message
 EOF
   exit "${1:-0}"
@@ -61,23 +61,29 @@ if [[ ! -d "$input_dir" ]]; then
   exit 1
 fi
 
-out_dir="$root_dir/tmp/quant_experiemnts/"
+out_dir="$root_dir/tmp/quant_experiments/"
 mkdir -p $out_dir
 
-# Hardcoded ImageNet-V2 validation subset used for calibration / comparison
-image_dir="$root_dir/tmp/val100"
-if [[ ! -d "$image_dir" ]]; then
-  echo "Error: image directory does not exist: $image_dir" >&2
+# Disjoint ImageNet-V2 subsets: calib for quantization, val for compare only.
+calib_dir="$root_dir/tmp/val200/split0"
+val_dir="$root_dir/tmp/val200/split1"
+if [[ ! -d "$calib_dir" ]]; then
+  echo "Error: calibration directory does not exist: $calib_dir" >&2
   exit 1
 fi
-# Single image shared by the "vishap" method and by validation/compare.
-input_image=$(find "$image_dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | sort | head -1)
+if [[ ! -d "$val_dir" ]]; then
+  echo "Error: validation directory does not exist: $val_dir" >&2
+  exit 1
+fi
+# Single calib image for vishap / mixed (must not appear in val_dir).
+input_image=$(find "$calib_dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | sort | head -1)
 if [[ -z "$input_image" ]]; then
-  echo "Error: no images found under $image_dir" >&2
+  echo "Error: no images found under $calib_dir" >&2
   exit 1
 fi
-echo "Using validation/vishap image: $input_image"
-num_images=$(find "$image_dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | wc -l)
+echo "Using calibration image (vishap/mixed): $input_image"
+echo "Using validation set for compare: $val_dir"
+num_images=$(find "$calib_dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | wc -l)
 
 quantize_script="$root_dir/scripts/ort_quantize.py"
 
@@ -85,11 +91,11 @@ quantize_script="$root_dir/scripts/ort_quantize.py"
 # label is used for output filenames, compare --type, and section banners.
 quant_methods=(
   "vishap|--method vishap --input-file ${input_image} --seed ${seed}"
-  "vishap_agg|--method vishap --input-dir ${image_dir} --num-inputs ${num_images} --seed ${seed}"
+  "vishap_agg|--method vishap --input-dir ${calib_dir} --num-inputs ${num_images} --seed ${seed}"
   "mixed_0.25|--method mixed --input-file ${input_image} --preload-ratio 0.25 --seed ${seed}"
   "mixed_0.50|--method mixed --input-file ${input_image} --preload-ratio 0.5 --seed ${seed}"
   "mixed_0.75|--method mixed --input-file ${input_image} --preload-ratio 0.75 --seed ${seed}"
-  "calibration|--method calibration --input-dir ${image_dir} --seed ${seed}"
+  "calibration|--method calibration --input-dir ${calib_dir} --seed ${seed}"
   "random|--method random --seed ${seed}"
 )
 date_string=$(date +%Y%m%d%H%M%S)
@@ -126,8 +132,8 @@ for onnx_file in "$input_dir"/*.onnx; do
     for method_spec in "${quant_methods[@]}"; do
       IFS='|' read -r label _ <<< "$method_spec"
       quant_file="$out_dir/${filename}_${label}.onnx"
-      echo python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$input_image" -o "quant_results_${date_string}.csv"
-      python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$input_image" -o "quant_results_${date_string}.csv"
+      echo python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "quant_results_${date_string}.csv"
+      python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "quant_results_${date_string}.csv"
     done
     echo
   fi

@@ -5,7 +5,7 @@ import time
 import numpy as np
 import onnxruntime as ort
 
-from utils import load_input_array
+from utils import load_input_array, collect_input_paths
 
 
 def _require_single_input(session: ort.InferenceSession, model_path: str):
@@ -73,58 +73,79 @@ def _topk_class_matches(float_out: np.ndarray, quant_out: np.ndarray, ks=(1, 5, 
     return matches
 
 
+def _accuracy_metrics(float_out: np.ndarray, quant_out: np.ndarray):
+    """Return MAE, max abs diff, cosine sim, top-k matches, and KL for one pair."""
+    mae = float(np.mean(np.abs(float_out - quant_out)))
+    max_diff = float(np.max(np.abs(float_out - quant_out)))
+
+    flat_float = float_out.flatten()
+    flat_quant = quant_out.flatten()
+    cosine_sim = float(
+        np.dot(flat_float, flat_quant)
+        / (np.linalg.norm(flat_float) * np.linalg.norm(flat_quant))
+    )
+
+    topk_matches = _topk_class_matches(float_out, quant_out)
+    kl_div = _kl_divergence(float_out, quant_out)
+    return mae, max_diff, cosine_sim, topk_matches, kl_div
+
+
 def _compare_models(
-    float_model_path: str, quant_model_path: str, input_arr: np.ndarray
+    float_model_path: str,
+    quant_model_path: str,
+    input_arrays: list[np.ndarray],
 ):
     print("Loading models into ONNX Runtime...")
-    # Use CPUExecutionProvider for a clean baseline comparison
     providers = ["CPUExecutionProvider"]
 
     sess_float = ort.InferenceSession(float_model_path, providers=providers)
     sess_quant = ort.InferenceSession(quant_model_path, providers=providers)
 
-    # Both models must be single-input and share the same input name/structure.
     input_meta = _require_single_input(sess_float, float_model_path)
     _require_single_input(sess_quant, quant_model_path)
-    input_dict = {input_meta.name: input_arr}
+    input_name = input_meta.name
 
-    # 3. Benchmark Float Model
-    # Warm up pass
-    _ = sess_float.run(None, input_dict)
-
+    # Latency: benchmark once on the first validation input.
+    latency_dict = {input_name: input_arrays[0]}
+    _ = sess_float.run(None, latency_dict)
     start_time = time.perf_counter()
     for _ in range(100):
-        float_outputs = sess_float.run(None, input_dict)
+        _ = sess_float.run(None, latency_dict)
     float_latency = (time.perf_counter() - start_time) / 100 * 1000  # convert to ms
 
-    # 4. Benchmark Quantized Model
-    # Warm up pass
-    _ = sess_quant.run(None, input_dict)
-
+    _ = sess_quant.run(None, latency_dict)
     start_time = time.perf_counter()
     for _ in range(100):
-        quant_outputs = sess_quant.run(None, input_dict)
+        _ = sess_quant.run(None, latency_dict)
     quant_latency = (time.perf_counter() - start_time) / 100 * 1000  # convert to ms
 
-    # 5. Compare Accuracy (assuming a single primary output)
-    float_out = float_outputs[0]
-    quant_out = quant_outputs[0]
+    # Accuracy: accumulate means over the full validation set.
+    mae_sum = 0.0
+    max_diff_sum = 0.0
+    cosine_sum = 0.0
+    kl_sum = 0.0
+    topk_sums = {1: 0.0, 5: 0.0, 10: 0.0}
+    n = len(input_arrays)
 
-    # Calculate Mean Absolute Error (MAE)
-    mae = np.mean(np.abs(float_out - quant_out))
+    for input_arr in input_arrays:
+        input_dict = {input_name: input_arr}
+        float_out = sess_float.run(None, input_dict)[0]
+        quant_out = sess_quant.run(None, input_dict)[0]
+        mae, max_diff, cosine_sim, topk_matches, kl_div = _accuracy_metrics(
+            float_out, quant_out
+        )
+        mae_sum += mae
+        max_diff_sum += max_diff
+        cosine_sum += cosine_sim
+        kl_sum += kl_div
+        for k in topk_sums:
+            topk_sums[k] += topk_matches[k]
 
-    # Calculate Max Absolute Difference
-    max_diff = np.max(np.abs(float_out - quant_out))
-
-    # Calculate Cosine Similarity to check directional alignment
-    flat_float = float_out.flatten()
-    flat_quant = quant_out.flatten()
-    cosine_sim = np.dot(flat_float, flat_quant) / (
-        np.linalg.norm(flat_float) * np.linalg.norm(flat_quant)
-    )
-
-    topk_matches = _topk_class_matches(float_out, quant_out)
-    kl_div = _kl_divergence(float_out, quant_out)
+    mae = mae_sum / n
+    max_diff = max_diff_sum / n
+    cosine_sim = cosine_sum / n
+    kl_div = kl_sum / n
+    topk_matches = {k: topk_sums[k] / n for k in topk_sums}
 
     # ==========================================
     # Print Results
@@ -137,15 +158,15 @@ def _compare_models(
     print(f"Int8 Latency:      {quant_latency:.2f} ms")
     print(f"Speedup factor:    {speedup:.2f}x")
     print("\n" + "=" * 40)
-    print(" ACCURACY")
+    print(f" ACCURACY (mean over {n} input(s))")
     print("=" * 40)
     print(f"Mean Absolute Error (MAE):    {mae:.6f}")
     print(f"Max Absolute Difference:      {max_diff:.6f}")
     print(f"Cosine Similarity (0 to 1):   {cosine_sim:.6f}")
     print(f"KL(float || quant) [nats]:    {kl_div:.6f}")
-    print(f"Top-1 class matches:          {topk_matches[1]:.0f} / 1")
-    print(f"Top-5 class matches:          {topk_matches[5]:.0f} / 5")
-    print(f"Top-10 class matches:         {topk_matches[10]:.0f} / 10")
+    print(f"Top-1 class matches:          {topk_matches[1]:.2f} / 1")
+    print(f"Top-5 class matches:          {topk_matches[5]:.2f} / 5")
+    print(f"Top-10 class matches:         {topk_matches[10]:.2f} / 10")
 
     return speedup, mae, max_diff, cosine_sim, topk_matches, kl_div
 
@@ -164,7 +185,7 @@ def _parse_args():
         "--input",
         type=str,
         required=True,
-        help="path to input file",
+        help="path to an input file or a directory of validation images",
     )
     parser.add_argument(
         "--type",
@@ -188,9 +209,13 @@ def _main():
     args = _parse_args()
 
     shape = _input_shape_from_onnx(args.float_model)
-    input_arr = load_input_array(args.input, shape, dtype=np.float32)
+    input_paths = collect_input_paths(args.input)
+    print(f"Scoring {len(input_paths)} validation input(s) from {args.input}")
+    input_arrays = [
+        load_input_array(path, shape, dtype=np.float32) for path in input_paths
+    ]
     speedup, mae, max_diff, cosine_sim, topk_matches, kl_div = _compare_models(
-        args.float_model, args.quant_model, input_arr
+        args.float_model, args.quant_model, input_arrays
     )
 
     results = {
