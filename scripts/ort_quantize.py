@@ -10,18 +10,23 @@ import sys
 import time
 
 from enum import Enum
-from onnxruntime.quantization import QuantType, quantize_static
+from onnxruntime.quantization import QuantFormat, QuantType, quantize_static
 from onnxruntime.quantization.calibrate import (
     CalibrationMethod,
     CalibrationDataReader,
-    # TODO: use ort-nightly to test CalibrationCache?
-    # TensorsData,
-    # TensorData,
-    # save_tensors_data
+    TensorData,
+    TensorsData,
 )
+from onnxruntime.quantization.qdq_quantizer import QDQQuantizer
+from onnxruntime.quantization.quant_utils import (
+    load_model_with_shape_infer,
+    update_opset_version,
+)
+from onnxruntime.quantization.registry import QDQRegistry, QLinearOpsRegistry
 from pathlib import Path
 
 from onnx2mlir import convert_onnx_to_mlir, load_onnx_model
+from mlir_runtime import CONSTANT_OP_NAMES
 from utils import (
     Stats,
     TMP_DIR,
@@ -34,6 +39,7 @@ from utils import (
     parse_vishap_module,
     preprocess_image,
     spatial_size,
+    collect_input_paths,
 )
 
 DEFAULT_SPATIAL_SIZE = 224
@@ -42,47 +48,6 @@ logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 QUANT_TMP_DIR = TMP_DIR / "quantization"
-
-
-class SmartDummyDataReader(CalibrationDataReader):
-    """
-    A dummy data reader that doesn't read any data
-    """
-
-    def __init__(self, model_path: str):
-        self.yielded = False
-        self.dummy_data = {}
-
-        # 1. Briefly load the model to inspect its required inputs
-        session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-
-        for inp in session.get_inputs():
-            # 2. Handle dynamic dimensions (e.g., 'batch_size', 'None', or 'unk__1')
-            # We replace any unknown text/None dimensions with 1 so numpy can build the array.
-            shape = [
-                1 if (isinstance(dim, str) or dim is None) else dim for dim in inp.shape
-            ]
-
-            # 3. Figure out the numpy data type (defaulting to float32)
-            if inp.type == "tensor(int64)":
-                dtype = np.int64
-            elif inp.type == "tensor(int32)":
-                dtype = np.int32
-            elif inp.type == "tensor(float16)":
-                dtype = np.float16
-            else:
-                dtype = np.float32
-
-            # 4. Create the dummy zero-tensor
-            self.dummy_data[inp.name] = np.zeros(shape, dtype=dtype)
-            logger.info(f"Created dummy input: '{inp.name}' of shape {shape} ({dtype})")
-
-    def get_next(self) -> dict:
-        if not self.yielded:
-            self.yielded = True
-            return self.dummy_data
-        # Return None on the second call to end the calibration loop cleanly
-        return None
 
 
 class RealDataCalibrationReader(CalibrationDataReader):
@@ -169,20 +134,6 @@ def _shuffle_paths(paths: list, seed: int | None) -> list:
     return [paths[i] for i in order]
 
 
-def _collect_image_paths(path: Path) -> list[Path]:
-    if path.is_file():
-        if not is_image_path(path):
-            raise ValueError(f"Not a supported image file: {path}")
-        return [path]
-    if not path.is_dir():
-        raise FileNotFoundError(f"Input path does not exist: {path}")
-
-    images = sorted(p for p in path.rglob("*") if p.is_file() and is_image_path(p))
-    if not images:
-        raise FileNotFoundError(f"No images found under {path}")
-    return images
-
-
 def load_inputs_for_model(
     model_path: str,
     input_path: str | Path,
@@ -212,7 +163,7 @@ def load_inputs_for_model(
                 npy_files = npy_files[:max_images]
             return [np.load(p) for p in npy_files]
 
-    image_paths = _shuffle_paths(_collect_image_paths(path), seed)
+    image_paths = _shuffle_paths(collect_input_paths(path), seed)
     if max_images is not None:
         image_paths = image_paths[:max_images]
 
@@ -251,20 +202,36 @@ def _get_onnx_node_names(onnx_model: onnx.ModelProto) -> list[str]:
     return node_names
 
 
-def _vishap_dist_to_tensor_quant(lambd, stats: Stats) -> list[dict[str, np.float32]]:
+def _vishap_dist_to_tensor_quant(
+    lambd, stats: Stats, *, use_real_minmax: bool = False
+) -> list[dict[str, np.float32]]:
     min_est, max_est, mean_est, var_est = stats
-    lowest = max(min_est, mean_est - lambd * np.sqrt(var_est))
-    highest = min(max_est, mean_est + lambd * np.sqrt(var_est))
+    if use_real_minmax:
+        lowest, highest = min_est, max_est
+    else:
+        lowest = max(min_est, mean_est - lambd * np.sqrt(var_est))
+        highest = min(max_est, mean_est + lambd * np.sqrt(var_est))
     return [{"rmin": np.float32(lowest), "rmax": np.float32(highest)}]
 
 
-def _save_perf_info(out_file: str, time_ms: int, method: str):
+def _ns_to_ms(start_ns: int, end_ns: int) -> float:
+    return (end_ns - start_ns) / 1_000_000
+
+
+def _save_perf_stages(
+    out_file: str,
+    network: str,
+    method: str,
+    stages: list[tuple[str, float]],
+) -> None:
+    """Append one CSV row per (stage, time_ms) for a quantization run."""
     is_empty = not os.path.isfile(out_file) or os.path.getsize(out_file) == 0
     with open(out_file, mode="a", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         if is_empty:
-            writer.writerow(["time_ms", "method"])
-        writer.writerow([time_ms, method])
+            writer.writerow(["network", "time_ms", "method", "stage"])
+        for stage, time_ms in stages:
+            writer.writerow([network, time_ms, method, stage])
 
 
 def _parse_onnx_loc_name(location: str) -> str:
@@ -276,10 +243,16 @@ def _parse_onnx_loc_name(location: str) -> str:
 
 def _collect_vishap_dists(
     mlir_module, valid_onnx_names: set[str]
-) -> tuple[dict[str, list[Stats]], list[Stats]]:
-    """Walk an annotated MLIR module and return (node_name -> output stats, entry output stats)."""
+) -> tuple[dict[str, list[Stats]], list[Stats], set[str]]:
+    """Walk an annotated MLIR module and return node stats, entry output stats, and constant names.
+
+    The constant-name set contains ONNX loc names whose MLIR op is in
+    ``CONSTANT_OP_NAMES`` (``stablehlo.constant`` / ``arith.constant``).
+    """
+
     onnx_name_to_dists: dict[str, list[Stats]] = {}
-    entry_output_stats: list[Stats] = []
+    func_output_stats: list[Stats] = []
+    constant_onnx_names: set[str] = set()
 
     # Assume entry function is the first operation in the module's body
     entry_func = mlir_module.body.operations[0]
@@ -295,14 +268,16 @@ def _collect_vishap_dists(
             tuple(np.float64(val) for val in dist)
             for dist in op.operation.attributes[VISHAP_DIST_ATTR]
         ]
+        if op.name in CONSTANT_OP_NAMES:
+            constant_onnx_names.add(onnx_name)
 
     if VISHAP_DIST_ATTR in entry_func.attributes:
-        entry_output_stats = [
+        func_output_stats = [
             tuple(np.float64(val) for val in dist)
             for dist in entry_func.operation.attributes[VISHAP_DIST_ATTR]
         ]
 
-    return onnx_name_to_dists, entry_output_stats
+    return onnx_name_to_dists, func_output_stats, constant_onnx_names
 
 
 def _annotate_module_in_memory(mlir_module, input_stats: list[Stats]):
@@ -330,9 +305,10 @@ def _annotate_module_in_memory(mlir_module, input_stats: list[Stats]):
 def _build_tensor_quant_overrides(
     onnx_model: onnx.ModelProto,
     onnx_name_to_dists: dict[str, list[Stats]],
-    entry_output_stats: list[Stats],
+    func_output_stats: list[Stats],
     input_stats: Stats,
     lambd: int,
+    constant_onnx_names: set[str] | None = None,
 ) -> dict[str, list[dict[str, np.float32]]]:
     """Map Vishap distribution estimates to ORT TensorQuantOverrides keys."""
     # Map ONNX node names (from MLIR locs) to actual output tensor names.
@@ -340,10 +316,12 @@ def _build_tensor_quant_overrides(
     node_name_to_outputs = {
         node.name: list(node.output) for node in onnx_model.graph.node if node.name
     }
+    constant_names = constant_onnx_names or set()
 
     injected_stats: dict[str, list[dict[str, np.float32]]] = {}
     for node_name, out_stats in onnx_name_to_dists.items():
         outputs = node_name_to_outputs.get(node_name, [])
+        use_real_minmax = node_name in constant_names
         for idx, stats in enumerate(out_stats):
             if idx >= len(outputs):
                 logger.warning(
@@ -353,15 +331,95 @@ def _build_tensor_quant_overrides(
                     len(outputs),
                 )
                 continue
-            injected_stats[outputs[idx]] = _vishap_dist_to_tensor_quant(lambd, stats)
+            injected_stats[outputs[idx]] = _vishap_dist_to_tensor_quant(
+                lambd, stats, use_real_minmax=use_real_minmax
+            )
 
     input_name = onnx_model.graph.input[0].name
     output_names = [out.name for out in onnx_model.graph.output]
     injected_stats[input_name] = _vishap_dist_to_tensor_quant(lambd, input_stats)
-    for output_name, stats in zip(output_names, entry_output_stats):
+    for output_name, stats in zip(output_names, func_output_stats):
         injected_stats[output_name] = _vishap_dist_to_tensor_quant(lambd, stats)
 
     return injected_stats
+
+
+def _default_op_types_to_quantize() -> list[str]:
+    """Match quantize_static's default: QLinear + QDQ registries."""
+    return list(set(QLinearOpsRegistry.keys()) | set(QDQRegistry.keys()))
+
+
+def _float_activation_tensor_names(model: onnx.ModelProto) -> set[str]:
+    """Collect names for float activations."""
+    value_infos = {vi.name: vi for vi in model.graph.value_info}
+    value_infos.update({out.name: out for out in model.graph.output})
+    value_infos.update({inp.name: inp for inp in model.graph.input})
+    initializer = {init.name for init in model.graph.initializer}
+    tensor_types = {onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16}
+    op_types = set(_default_op_types_to_quantize())
+
+    tensors = set()
+    for node in model.graph.node:
+        if node.op_type not in op_types:
+            continue
+        for tensor_name in list(node.input) + list(node.output):
+            vi = value_infos.get(tensor_name)
+            if vi is None:
+                continue
+            if (
+                vi.type.HasField("tensor_type")
+                and vi.type.tensor_type.elem_type in tensor_types
+                and tensor_name not in initializer
+            ):
+                tensors.add(tensor_name)
+    return tensors
+
+
+def _tensors_data_from_overrides(
+    model: onnx.ModelProto,
+    injected_stats: dict[str, list[dict[str, np.float32]]],
+) -> TensorsData:
+    """Build MinMax TensorsData from overrides, with (0, 0) fallback for the rest.
+
+    Fill unannotated tensors with degenerate (0, 0) ranges so QDQ still sees
+    every activation.
+    """
+    zero = np.float32(0)
+    data = {
+        name: TensorData(lowest=zero, highest=zero)
+        for name in _float_activation_tensor_names(model)
+    }
+    for name, ranges in injected_stats.items():
+        data[name] = TensorData(
+            lowest=np.float32(ranges[0]["rmin"]),
+            highest=np.float32(ranges[0]["rmax"]),
+        )
+    return TensorsData(CalibrationMethod.MinMax, data)
+
+
+def _quantize_from_overrides(
+    input_model: str,
+    output_model: str,
+    injected_stats: dict[str, list[dict[str, np.float32]]],
+):
+    """QDQ-quantize using supplied rmin/rmax, without a calibration inference pass."""
+    model = load_model_with_shape_infer(Path(input_model))
+    model = update_opset_version(model, QuantType.QInt8)
+    tensors_range = _tensors_data_from_overrides(model, injected_stats)
+    quantizer = QDQQuantizer(
+        model,
+        per_channel=False,
+        reduce_range=False,
+        weight_qType=QuantType.QInt8,
+        activation_qType=QuantType.QUInt8,
+        tensors_range=tensors_range,
+        nodes_to_quantize=[],
+        nodes_to_exclude=[],
+        op_types_to_quantize=_default_op_types_to_quantize(),
+        extra_options={},
+    )
+    quantizer.quantize_model()
+    quantizer.model.save_model_to_file(output_model)
 
 
 def _load_onnx_and_mlir(input_model: str):
@@ -381,29 +439,29 @@ def _quantize_with_vishap_dists(
     annotated_module,
     input_stats: Stats,
     lambd: int,
-):
+) -> list[tuple[str, float]]:
+    t0 = time.perf_counter_ns()
     valid_onnx_names = set(_get_onnx_node_names(onnx_model))
-    onnx_name_to_dists, entry_output_stats = _collect_vishap_dists(
+    onnx_name_to_dists, func_output_stats, constant_onnx_names = _collect_vishap_dists(
         annotated_module, valid_onnx_names
     )
+    t1 = time.perf_counter_ns()
     injected_stats = _build_tensor_quant_overrides(
         onnx_model,
         onnx_name_to_dists,
-        entry_output_stats,
+        func_output_stats,
         input_stats,
         lambd,
+        constant_onnx_names,
     )
-    extra_options = {"TensorQuantOverrides": injected_stats}
-    quantize_static(
-        model_input=input_model,
-        model_output=output_model,
-        calibration_data_reader=SmartDummyDataReader(input_model),
-        calibrate_method=CalibrationMethod.MinMax,
-        activation_type=QuantType.QUInt8,
-        weight_type=QuantType.QInt8,
-        # Override quantization parameters with Vishap estimations
-        extra_options=extra_options,
-    )
+    t2 = time.perf_counter_ns()
+    _quantize_from_overrides(input_model, output_model, injected_stats)
+    t3 = time.perf_counter_ns()
+    return [
+        ("collect_dists", _ns_to_ms(t0, t1)),
+        ("build_overrides", _ns_to_ms(t1, t2)),
+        ("quantize", _ns_to_ms(t2, t3)),
+    ]
 
 
 def _vishap_quantization(
@@ -416,8 +474,9 @@ def _vishap_quantization(
     seed: int | None = None,
     perf_out: str = "perf_info.csv",
 ):
-    start = time.perf_counter_ns()
+    t0 = time.perf_counter_ns()
     onnx_model, mlir_module = _load_onnx_and_mlir(input_model)
+    t1 = time.perf_counter_ns()
     if onnx_model is None or mlir_module is None:
         return
 
@@ -455,19 +514,30 @@ def _vishap_quantization(
 
     try:
         # We assume one input tensor per model
+        t2 = time.perf_counter_ns()
         annotated_module = _annotate_module_in_memory(mlir_module, [input_stats])
+        t3 = time.perf_counter_ns()
     except Exception as e:
         logger.error("Vishap quantization failed")
         logger.error(e)
         return
 
-    _quantize_with_vishap_dists(
+    quant_stages = _quantize_with_vishap_dists(
         input_model, output_model, onnx_model, annotated_module, input_stats, lambd
     )
 
-    end = time.perf_counter_ns()
     perf_method = "vishap_agg" if num_inputs > 1 else "vishap"
-    _save_perf_info(perf_out, (end - start) / 1_000_000, perf_method)
+    _save_perf_stages(
+        perf_out,
+        Path(input_model).stem,
+        perf_method,
+        [
+            ("onnx2mlir", _ns_to_ms(t0, t1)),
+            ("collect_inputs", _ns_to_ms(t1, t2)),
+            ("static_analysis", _ns_to_ms(t2, t3)),
+            *quant_stages,
+        ],
+    )
 
 
 def _module_bytecode(mlir_module) -> bytes:
@@ -494,8 +564,9 @@ def _mixed_quantization(
         run_probed_network,
     )
 
-    start = time.perf_counter_ns()
+    t0 = time.perf_counter_ns()
     onnx_model, mlir_module = _load_onnx_and_mlir(input_model)
+    t1 = time.perf_counter_ns()
     if onnx_model is None:
         return
 
@@ -516,6 +587,7 @@ def _mixed_quantization(
     bytecode = _module_bytecode(mlir_module)
 
     try:
+        t2 = time.perf_counter_ns()
         probe_module = parse_vishap_module(bytecode)
         targets = collect_all_float_probe_targets(probe_module)
         func = probe_module.body.operations[0]
@@ -540,9 +612,14 @@ def _mixed_quantization(
         n_preloaded = attach_probe_dists_to_ops(
             mixed_module, targets, probe_dists, preload_ratio, seed
         )
+        t3 = time.perf_counter_ns()
         logger.info("Preloaded probe distributions on %d ops", n_preloaded)
+
+        t4 = time.perf_counter_ns()
         annotate_distributions_on_module(mixed_module, [input_stats])
-        _quantize_with_vishap_dists(
+        t5 = time.perf_counter_ns()
+
+        quant_stages = _quantize_with_vishap_dists(
             input_model,
             output_model,
             onnx_model,
@@ -560,8 +637,18 @@ def _mixed_quantization(
         logger.error(e)
         return
 
-    end = time.perf_counter_ns()
-    _save_perf_info(perf_out, (end - start) / 1_000_000, f"mixed_{preload_ratio:.2f}")
+    _save_perf_stages(
+        perf_out,
+        Path(input_model).stem,
+        f"mixed_{preload_ratio:.2f}",
+        [
+            ("onnx2mlir", _ns_to_ms(t0, t1)),
+            ("collect_inputs", _ns_to_ms(t1, t2)),
+            ("probe", _ns_to_ms(t2, t3)),
+            ("static_analysis", _ns_to_ms(t4, t5)),
+            *quant_stages,
+        ],
+    )
 
 
 def _calibration_quantization(
@@ -571,19 +658,25 @@ def _calibration_quantization(
     seed: int | None = None,
     perf_out: str = "perf_info.csv",
 ):
-    start = time.perf_counter_ns()
+    t0 = time.perf_counter_ns()
     quantize_static(
         model_input=input_model,
         model_output=output_model,
         calibration_data_reader=RealDataCalibrationReader(
             input_model, load_inputs_for_model(input_model, input_dir, seed=seed)
         ),
+        quant_format=QuantFormat.QDQ,
         calibrate_method=CalibrationMethod.MinMax,
         activation_type=QuantType.QUInt8,
         weight_type=QuantType.QInt8,
     )
-    end = time.perf_counter_ns()
-    _save_perf_info(perf_out, (end - start) / 1_000_000, "calibration")
+    t1 = time.perf_counter_ns()
+    _save_perf_stages(
+        perf_out,
+        Path(input_model).stem,
+        "calibration",
+        [("quantization", _ns_to_ms(t0, t1))],
+    )
 
 
 def _random_quantization(
@@ -592,7 +685,7 @@ def _random_quantization(
     seed: int | None = None,
     perf_out: str = "perf_info.csv",
 ):
-    start = time.perf_counter_ns()
+    t0 = time.perf_counter_ns()
     onnx_model = onnx.load(input_model)
     graph = onnx_model.graph
 
@@ -607,20 +700,19 @@ def _random_quantization(
         injected_stats[tensor] = [
             {"rmin": min(bound1, bound2), "rmax": max(bound1, bound2)}
         ]
+    t1 = time.perf_counter_ns()
 
-    extra_options = {"TensorQuantOverrides": injected_stats}
-    quantize_static(
-        model_input=input_model,
-        model_output=output_model,
-        calibration_data_reader=SmartDummyDataReader(input_model),
-        calibrate_method=CalibrationMethod.MinMax,
-        activation_type=QuantType.QUInt8,
-        weight_type=QuantType.QInt8,
-        # Override quantization parameters with Vishap estimations
-        extra_options=extra_options,
+    _quantize_from_overrides(input_model, output_model, injected_stats)
+    t2 = time.perf_counter_ns()
+    _save_perf_stages(
+        perf_out,
+        Path(input_model).stem,
+        "random",
+        [
+            ("build_overrides", _ns_to_ms(t0, t1)),
+            ("quantize", _ns_to_ms(t1, t2)),
+        ],
     )
-    end = time.perf_counter_ns()
-    _save_perf_info(perf_out, (end - start) / 1_000_000, "random")
 
 
 def _parse_args():
