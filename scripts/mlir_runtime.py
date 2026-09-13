@@ -12,6 +12,7 @@ from utils import (
     ensure_vishap_bindings_on_path,
     get_array_stats,
     get_llvm_build_dir,
+    parse_onnx_loc_name,
 )
 
 logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
@@ -228,6 +229,127 @@ def attach_probe_dists_to_ops(
             if i not in chosen:
                 continue
             ops[walk_idx].attributes[VISHAP_DIST_ATTR] = stats_list_to_dist_attr(
+                dists, module.context
+            )
+    return n
+
+
+def collect_mixed_float_ops(module, node_name_to_outputs: dict[str, list[str]]) -> dict:
+    """Map ONNX node name to the matching non-constant float MLIR op.
+
+    An op is a candidate when its ONNX loc name maps (via
+    ``node_name_to_outputs``) to a node whose output count matches the op's
+    float result count. Constants and ops nested in regions are skipped.
+    When several ops share a loc name (one ONNX node expanded into multiple
+    MLIR ops), only the last one in walk order is kept, since it produces
+    the value matching the ONNX node's output.
+    """
+    candidates_by_name = {}
+    for op in walk_entry_ops(module):
+        if op.name in CONSTANT_OP_NAMES or _is_nested_in_region(op):
+            continue
+        onnx_name = parse_onnx_loc_name(str(op.location))
+        outputs = node_name_to_outputs.get(onnx_name)
+        if not outputs:
+            continue
+        results = list(op.results)
+        if len(results) != len(outputs) or not all(
+            is_float_ranked_tensor_type(result.type) for result in results
+        ):
+            continue
+        candidates_by_name[onnx_name] = op
+    return candidates_by_name
+
+
+def mixed_candidate_op_types(
+    module,
+    node_name_to_outputs: dict[str, list[str]],
+    node_name_to_op_type: dict[str, str],
+) -> list[str]:
+    """Sorted unique ONNX op types among mixed float candidates, excluding Constant."""
+    types = {
+        node_name_to_op_type[name]
+        for name in collect_mixed_float_ops(module, node_name_to_outputs)
+        if name in node_name_to_op_type and node_name_to_op_type[name] != "Constant"
+    }
+    return sorted(types)
+
+
+def attach_tensor_stats_to_ops(
+    module,
+    tensor_stats: dict[str, Stats],
+    node_name_to_outputs: dict[str, list[str]],
+    ratio: float | None = None,
+    seed: int | None = None,
+    *,
+    node_name_to_op_type: dict[str, str] | None = None,
+    vishap_op_type: str | None = None,
+) -> int:
+    """Preload ONNX tensor stats onto a subset of matching MLIR ops.
+
+    Selection is either a random ``ratio`` of candidates, or every candidate
+    whose ONNX op type is not ``vishap_op_type`` (those ops are left for
+    Vishap static analysis). Exactly one of ``ratio`` or ``vishap_op_type``
+    must be set.
+
+    An op is a candidate when it is a mixed float op (see
+    ``collect_mixed_float_ops``) and every output tensor has an entry in
+    ``tensor_stats``. Returns the number of ops that received
+    ``vishap.distribution``.
+    """
+    if (ratio is None) == (vishap_op_type is None):
+        raise ValueError("exactly one of ratio or vishap_op_type must be set")
+    if ratio is not None and not 0.0 <= ratio <= 1.0:
+        raise ValueError(f"preload ratio must be in [0, 1], got {ratio}")
+    if vishap_op_type is not None and node_name_to_op_type is None:
+        raise ValueError("node_name_to_op_type is required when vishap_op_type is set")
+
+    mixed_ops = collect_mixed_float_ops(module, node_name_to_outputs)
+    candidates: list[tuple] = []
+    for onnx_name, op in mixed_ops.items():
+        outputs = node_name_to_outputs[onnx_name]
+        if any(name not in tensor_stats for name in outputs):
+            continue
+        candidates.append(
+            (op, [tensor_stats[name] for name in outputs], onnx_name)
+        )
+
+    if vishap_op_type is not None:
+        chosen = {
+            i
+            for i, (_, _, name) in enumerate(candidates)
+            if node_name_to_op_type.get(name) != vishap_op_type
+        }
+        n = len(chosen)
+        logger.info(
+            "Preloading tensor stats onto %d/%d candidate ops "
+            "(vishap-op-type=%s, %d left for Vishap)",
+            n,
+            len(candidates),
+            vishap_op_type,
+            len(candidates) - n,
+        )
+    else:
+        n = min(len(candidates), max(0, int(round(ratio * len(candidates)))))
+        logger.info(
+            "Preloading tensor stats onto %d/%d candidate ops (ratio=%s)",
+            n,
+            len(candidates),
+            ratio,
+        )
+        if n == 0:
+            return 0
+        rng = np.random.default_rng(seed)
+        chosen = {int(i) for i in rng.choice(len(candidates), size=n, replace=False)}
+
+    if n == 0:
+        return 0
+
+    with module.context, Location.unknown():
+        for i, (op, dists, _) in enumerate(candidates):
+            if i not in chosen:
+                continue
+            op.attributes[VISHAP_DIST_ATTR] = stats_list_to_dist_attr(
                 dists, module.context
             )
     return n
