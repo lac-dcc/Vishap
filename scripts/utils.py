@@ -137,6 +137,13 @@ def annotate_distributions(module_asm: bytes | str, input_stats: list[Stats]):
     return module
 
 
+def parse_onnx_loc_name(location: str) -> str:
+    """Strip loc("...") wrapper from an MLIR location string, if present."""
+    if location.startswith('loc("') and location.endswith('")'):
+        return location[5:-2]
+    return location
+
+
 def get_array_stats(array: np.ndarray) -> Stats:
     return (
         np.float64(array.min()),

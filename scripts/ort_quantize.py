@@ -26,7 +26,7 @@ from onnxruntime.quantization.registry import QDQRegistry, QLinearOpsRegistry
 from pathlib import Path
 
 from onnx2mlir import convert_onnx_to_mlir, load_onnx_model
-from mlir_runtime import CONSTANT_OP_NAMES
+from mlir_runtime import CONSTANT_OP_NAMES, mixed_candidate_op_types
 from utils import (
     Stats,
     TMP_DIR,
@@ -36,6 +36,7 @@ from utils import (
     get_array_stats,
     is_image_path,
     is_nchw_layout,
+    parse_onnx_loc_name,
     parse_vishap_module,
     preprocess_image,
     spatial_size,
@@ -185,6 +186,56 @@ def export_model_input(
     logger.info(f"Exported input tensor of shape {batches[0].shape} to {output_npy}")
 
 
+def _onnx_node_maps(
+    onnx_model: onnx.ModelProto,
+) -> tuple[dict[str, list[str]], dict[str, str]]:
+    """Return (node_name -> outputs, node_name -> op_type) for named nodes."""
+    node_name_to_outputs: dict[str, list[str]] = {}
+    node_name_to_op_type: dict[str, str] = {}
+    for node in onnx_model.graph.node:
+        if not node.name:
+            continue
+        node_name_to_outputs[node.name] = list(node.output)
+        node_name_to_op_type[node.name] = node.op_type
+    return node_name_to_outputs, node_name_to_op_type
+
+
+def _sanitize_op_type_label(op_type: str) -> str:
+    """Make an ONNX op type safe for filenames and CSV method labels."""
+    return op_type.replace("/", "_").replace(":", "_")
+
+
+def _non_constant_onnx_op_types(onnx_model: onnx.ModelProto) -> set[str]:
+    return {
+        node.op_type for node in onnx_model.graph.node if node.op_type != "Constant"
+    }
+
+
+def _list_mixed_op_types(input_model: str) -> int:
+    """Print mixed float ONNX op types (one per line) and return an exit code."""
+    onnx_model, mlir_module = _load_onnx_and_mlir(input_model)
+    if onnx_model is None or mlir_module is None:
+        return 1
+    try:
+        vishap_module = parse_vishap_module(_module_bytecode(mlir_module))
+    except ImportError:
+        logger.error(
+            "Unable to import Vishap Python bindings. Make sure to build Vishap with bindings enabled."
+        )
+        return 1
+    except Exception as e:
+        logger.error("Failed to parse MLIR module for op-type listing")
+        logger.error(e)
+        return 1
+
+    node_name_to_outputs, node_name_to_op_type = _onnx_node_maps(onnx_model)
+    for op_type in mixed_candidate_op_types(
+        vishap_module, node_name_to_outputs, node_name_to_op_type
+    ):
+        print(op_type)
+    return 0
+
+
 def _get_onnx_node_names(onnx_model: onnx.ModelProto) -> list[str]:
     node_names = []
 
@@ -234,13 +285,6 @@ def _save_perf_stages(
             writer.writerow([network, time_ms, method, stage])
 
 
-def _parse_onnx_loc_name(location: str) -> str:
-    """Strip loc("...") wrapper from an MLIR location string, if present."""
-    if location.startswith('loc("') and location.endswith('")'):
-        return location[5:-2]
-    return location
-
-
 def _collect_vishap_dists(
     mlir_module, valid_onnx_names: set[str]
 ) -> tuple[dict[str, list[Stats]], list[Stats], set[str]]:
@@ -260,7 +304,7 @@ def _collect_vishap_dists(
         if VISHAP_DIST_ATTR not in op.attributes:
             continue
 
-        onnx_name = _parse_onnx_loc_name(str(op.location))
+        onnx_name = parse_onnx_loc_name(str(op.location))
         if onnx_name not in valid_onnx_names:
             continue
 
@@ -373,6 +417,58 @@ def _float_activation_tensor_names(model: onnx.ModelProto) -> set[str]:
             ):
                 tensors.add(tensor_name)
     return tensors
+
+
+def _collect_ort_tensor_stats(
+    onnx_model: onnx.ModelProto, batch: np.ndarray
+) -> dict[str, Stats]:
+    """Run one ORT inference exposing float activations and return their stats.
+
+    We fetch raw intermediate tensors and computes full (min, max, mean,
+    variance) tuples, as required by Vishap. Graph optimizations are disabled
+    so fusions do not remove observed tensors.
+    """
+    augmented = onnx.ModelProto()
+    augmented.CopyFrom(onnx_model)
+    graph = augmented.graph
+
+    value_infos = {vi.name: vi for vi in graph.value_info}
+    initializers = {init.name for init in graph.initializer}
+    exposed = {out.name for out in graph.output}
+    float_types = {
+        onnx.TensorProto.FLOAT,
+        onnx.TensorProto.DOUBLE,
+        onnx.TensorProto.FLOAT16,
+    }
+
+    for node in graph.node:
+        for tensor_name in node.output:
+            if tensor_name in exposed or tensor_name in initializers:
+                continue
+            vi = value_infos.get(tensor_name)
+            if (
+                vi is not None
+                and vi.type.HasField("tensor_type")
+                and vi.type.tensor_type.elem_type in float_types
+            ):
+                # Expose as graph output so we can observe it
+                graph.output.append(vi)
+                exposed.add(tensor_name)
+
+    sess_options = ort.SessionOptions()
+    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    session = ort.InferenceSession(
+        augmented.SerializeToString(),
+        sess_options=sess_options,
+        providers=["CPUExecutionProvider"],
+    )
+    input_name = session.get_inputs()[0].name
+    output_names = [out.name for out in session.get_outputs()]
+    results = session.run(None, {input_name: batch})
+    return {
+        name: get_array_stats(np.asarray(arr).astype(np.float32))
+        for name, arr in zip(output_names, results)
+    }
 
 
 def _tensors_data_from_overrides(
@@ -552,22 +648,17 @@ def _mixed_quantization(
     input_file: str | None = None,
     input_dir: str | None = None,
     lambd: int = 5,
-    preload_ratio: float = 0.5,
+    preload_ratio: float | None = None,
+    vishap_op_type: str | None = None,
     seed: int | None = None,
     perf_out: str = "perf_info.csv",
 ):
-    from mlir_runtime import (
-        attach_probe_dists_to_ops,
-        collect_all_float_probe_targets,
-        io_arrays_from_entry_func,
-        parse_probe_report,
-        run_probed_network,
-    )
+    from mlir_runtime import attach_tensor_stats_to_ops
 
     t0 = time.perf_counter_ns()
     onnx_model, mlir_module = _load_onnx_and_mlir(input_model)
     t1 = time.perf_counter_ns()
-    if onnx_model is None:
+    if onnx_model is None or mlir_module is None:
         return
 
     if input_file:
@@ -584,36 +675,44 @@ def _mixed_quantization(
         return None
 
     input_stats = get_array_stats(batches[0])
-    bytecode = _module_bytecode(mlir_module)
 
     try:
         t2 = time.perf_counter_ns()
-        probe_module = parse_vishap_module(bytecode)
-        targets = collect_all_float_probe_targets(probe_module)
-        func = probe_module.body.operations[0]
-        func_name = func.attributes["sym_name"].value
-        input_arrays, output_arrays = io_arrays_from_entry_func(
-            probe_module, [batches[0]]
-        )
-        logger.info(
-            "Running probed network (%d float ops) to collect telemetry",
-            len(targets),
-        )
-        run_probed_network(
-            probe_module,
-            input_arrays,
-            output_arrays,
-            func_name,
-            all_float_ops=True,
-        )
-        probe_dists = parse_probe_report()
-
-        mixed_module = parse_vishap_module(bytecode)
-        n_preloaded = attach_probe_dists_to_ops(
-            mixed_module, targets, probe_dists, preload_ratio, seed
-        )
+        logger.info("Running ORT inference to collect activation stats")
+        tensor_stats = _collect_ort_tensor_stats(onnx_model, batches[0])
+        node_name_to_outputs, node_name_to_op_type = _onnx_node_maps(onnx_model)
+        mixed_module = parse_vishap_module(_module_bytecode(mlir_module))
+        if vishap_op_type is not None:
+            candidate_types = set(
+                mixed_candidate_op_types(
+                    mixed_module, node_name_to_outputs, node_name_to_op_type
+                )
+            )
+            if vishap_op_type not in _non_constant_onnx_op_types(onnx_model):
+                logger.error(
+                    "Unknown ONNX op type %s; not present among non-constant nodes",
+                    vishap_op_type,
+                )
+                return
+            if vishap_op_type not in candidate_types:
+                logger.error(
+                    "ONNX op type %s has no mixed float candidates for Vishap analysis",
+                    vishap_op_type,
+                )
+                return
+            n_preloaded = attach_tensor_stats_to_ops(
+                mixed_module,
+                tensor_stats,
+                node_name_to_outputs,
+                node_name_to_op_type=node_name_to_op_type,
+                vishap_op_type=vishap_op_type,
+            )
+        else:
+            n_preloaded = attach_tensor_stats_to_ops(
+                mixed_module, tensor_stats, node_name_to_outputs, preload_ratio, seed
+            )
         t3 = time.perf_counter_ns()
-        logger.info("Preloaded probe distributions on %d ops", n_preloaded)
+        logger.info("Preloaded ORT distributions on %d ops", n_preloaded)
 
         t4 = time.perf_counter_ns()
         annotate_distributions_on_module(mixed_module, [input_stats])
@@ -637,10 +736,14 @@ def _mixed_quantization(
         logger.error(e)
         return
 
+    if vishap_op_type is not None:
+        perf_method = f"mixed_op_{_sanitize_op_type_label(vishap_op_type)}"
+    else:
+        perf_method = f"mixed_{preload_ratio:.2f}"
     _save_perf_stages(
         perf_out,
         Path(input_model).stem,
-        f"mixed_{preload_ratio:.2f}",
+        perf_method,
         [
             ("onnx2mlir", _ns_to_ms(t0, t1)),
             ("collect_inputs", _ns_to_ms(t1, t2)),
@@ -779,7 +882,28 @@ def _parse_args():
         default=None,
         help=(
             "fraction of non-constant float ops to preload with probe telemetry "
-            "for mixed quantization (required for --method mixed, in [0, 1])"
+            "for mixed quantization (in [0, 1]; mutually exclusive with "
+            "--vishap-op-type)"
+        ),
+    )
+    parser.add_argument(
+        "--vishap-op-type",
+        dest="vishap_op_type",
+        type=str,
+        default=None,
+        help=(
+            "ONNX op type to analyze with Vishap during mixed quantization; all "
+            "other non-constant float ops are preloaded from ORT (mutually "
+            "exclusive with --preload-ratio)"
+        ),
+    )
+    parser.add_argument(
+        "--list-op-types",
+        dest="list_op_types",
+        action="store_true",
+        help=(
+            "print mixed float ONNX op types in the input graph (one per line) "
+            "and exit"
         ),
     )
     parser.add_argument(
@@ -808,6 +932,9 @@ def _main():
 
     np.random.seed(args.seed)
 
+    if args.list_op_types:
+        return _list_mixed_op_types(args.input_model)
+
     if args.export_input:
         source = args.input_file or args.input_dir
         if not source:
@@ -817,7 +944,9 @@ def _main():
         return 0
 
     if not args.output_model:
-        logger.error("--output-model is required unless using --export-input")
+        logger.error(
+            "--output-model is required unless using --export-input or --list-op-types"
+        )
         return 1
 
     if args.num_inputs < 1:
@@ -838,10 +967,13 @@ def _main():
                 args.perf_out,
             )
         case QuantMethod.mixed:
-            if args.preload_ratio is None:
-                logger.error("Mixed quantization requires --preload-ratio")
+            if (args.preload_ratio is None) == (args.vishap_op_type is None):
+                logger.error(
+                    "Mixed quantization requires exactly one of "
+                    "--preload-ratio or --vishap-op-type"
+                )
                 return 1
-            if not 0.0 <= args.preload_ratio <= 1.0:
+            if args.preload_ratio is not None and not 0.0 <= args.preload_ratio <= 1.0:
                 logger.error("--preload-ratio must be in [0, 1]")
                 return 1
             if args.num_inputs > 1:
@@ -856,6 +988,7 @@ def _main():
                 args.input_dir,
                 args.lambd,
                 args.preload_ratio,
+                args.vishap_op_type,
                 args.seed,
                 args.perf_out,
             )
