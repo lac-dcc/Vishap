@@ -50,6 +50,11 @@ except:
     )
     exit(1)
 
+# torch-mlir ONNX converters are version-gated. MaxPool is registered at
+# sinceVersion=12 and BatchNormalization at 15, so older models (e.g. opset 9)
+# fail with `failed to legalize operation 'torch.operator'`.
+_TORCH_MLIR_TARGET_OPSET = 15
+
 
 def _dump_module(module, output_filename, binary_format=False, max_constant=None):
     if binary_format:
@@ -72,17 +77,40 @@ def _dump_module(module, output_filename, binary_format=False, max_constant=None
         output_file.close()
 
 
+def _onnx_default_opset(model: onnx.ModelProto) -> int | None:
+    for opset in model.opset_import:
+        if opset.domain in ("", "ai.onnx"):
+            return opset.version
+    return None
+
+
+def _upgrade_onnx_opset_for_torch_mlir(model: onnx.ModelProto) -> onnx.ModelProto:
+    """Rewrite the model to an opset supported by torch-mlir's ONNX converters."""
+    current = _onnx_default_opset(model)
+    if current is None or current >= _TORCH_MLIR_TARGET_OPSET:
+        return model
+
+    logger.info(
+        "Upgrading ONNX opset from %s to %s for torch-mlir conversion",
+        current,
+        _TORCH_MLIR_TARGET_OPSET,
+    )
+    return onnx.version_converter.convert_version(model, _TORCH_MLIR_TARGET_OPSET)
+
+
 def load_onnx_model(model: str) -> onnx.ModelProto:
     """Load, name unnamed nodes, and run shape inference."""
     raw_model = onnx.load(model)
+    valid_opset_model = _upgrade_onnx_opset_for_torch_mlir(raw_model)
+
     # ONNX nodes don't strictly require names. If they are unnamed,
     # MLIR location tracking drops them. We force a name for every node.
-    for i, node in enumerate(raw_model.graph.node):
+    for i, node in enumerate(valid_opset_model.graph.node):
         if not node.name:
             node.name = f"{node.op_type}_{i}"
 
     try:
-        return onnx.shape_inference.infer_shapes(raw_model)
+        return onnx.shape_inference.infer_shapes(valid_opset_model)
     except onnx.onnx_cpp2py_export.shape_inference.InferenceError:
         logger.error("Failed to infer shapes for ONNX model")
         raise
