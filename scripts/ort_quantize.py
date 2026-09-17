@@ -9,7 +9,7 @@ import os
 import sys
 import time
 
-from enum import Enum
+from enum import Enum, IntEnum
 from onnxruntime.quantization import QuantFormat, QuantType, quantize_static
 from onnxruntime.quantization.calibrate import (
     CalibrationMethod,
@@ -50,6 +50,9 @@ logger = logging.getLogger(__name__)
 
 QUANT_TMP_DIR = TMP_DIR / "quantization"
 
+class LogicalResult(IntEnum):
+    SUCCESS = 0
+    FAILURE = 1
 
 class RealDataCalibrationReader(CalibrationDataReader):
     """
@@ -569,30 +572,31 @@ def _vishap_quantization(
     num_inputs: int = 1,
     seed: int | None = None,
     perf_out: str = "perf_info.csv",
-):
+) -> LogicalResult:
     t0 = time.perf_counter_ns()
     onnx_model, mlir_module = _load_onnx_and_mlir(input_model)
     t1 = time.perf_counter_ns()
     if onnx_model is None or mlir_module is None:
-        return
+        logger.error("Could not load ONNX model")
+        return LogicalResult.FAILURE
 
     if input_file:
         if num_inputs > 1:
             logger.error("--num-inputs > 1 requires --input-dir, not --input-file")
-            return
+            return LogicalResult.FAILURE
         input_source = input_file
     elif input_dir:
         input_source = input_dir
     else:
         logger.error("Vishap quantization requires --input-file or --input-dir")
-        return
+        return LogicalResult.FAILURE
 
     batches = load_inputs_for_model(
         input_model, input_source, max_images=num_inputs, seed=seed
     )
     if not batches:
         logger.error(f"No inputs loaded from {input_source}")
-        return
+        return LogicalResult.FAILURE
     if len(batches) < num_inputs:
         logger.warning(
             "Requested %d input(s) but only loaded %d from %s",
@@ -616,7 +620,7 @@ def _vishap_quantization(
     except Exception as e:
         logger.error("Vishap quantization failed")
         logger.error(e)
-        return
+        return LogicalResult.FAILURE
 
     quant_stages = _quantize_with_vishap_dists(
         input_model, output_model, onnx_model, annotated_module, input_stats, lambd
@@ -634,6 +638,8 @@ def _vishap_quantization(
             *quant_stages,
         ],
     )
+
+    return LogicalResult.SUCCESS
 
 
 def _module_bytecode(mlir_module) -> bytes:
@@ -658,8 +664,9 @@ def _mixed_quantization(
     t0 = time.perf_counter_ns()
     onnx_model, mlir_module = _load_onnx_and_mlir(input_model)
     t1 = time.perf_counter_ns()
-    if onnx_model is None or mlir_module is None:
-        return
+    if onnx_model is None:
+        logger.error("Could not load ONNX model")
+        return LogicalResult.FAILURE
 
     if input_file:
         input_source = input_file
@@ -667,12 +674,12 @@ def _mixed_quantization(
         input_source = input_dir
     else:
         logger.error("Mixed quantization requires --input-file or --input-dir")
-        return None
+        return LogicalResult.FAILURE
 
     batches = load_inputs_for_model(input_model, input_source, max_images=1, seed=seed)
     if not batches or batches[0] is None:
         logger.error(f"No inputs loaded from {input_source}")
-        return None
+        return LogicalResult.FAILURE
 
     input_stats = get_array_stats(batches[0])
 
@@ -730,11 +737,11 @@ def _mixed_quantization(
         logger.error(
             "Unable to import Vishap Python bindings. Make sure to build Vishap with bindings enabled."
         )
-        return
+        return LogicalResult.FAILURE
     except Exception as e:
         logger.error("Mixed quantization failed")
         logger.error(e)
-        return
+        return LogicalResult.FAILURE
 
     if vishap_op_type is not None:
         perf_method = f"mixed_op_{_sanitize_op_type_label(vishap_op_type)}"
@@ -753,6 +760,8 @@ def _mixed_quantization(
         ],
     )
 
+    return LogicalResult.SUCCESS
+
 
 def _calibration_quantization(
     input_model: str,
@@ -760,7 +769,7 @@ def _calibration_quantization(
     input_dir: str,
     seed: int | None = None,
     perf_out: str = "perf_info.csv",
-):
+) -> LogicalResult:
     t0 = time.perf_counter_ns()
     quantize_static(
         model_input=input_model,
@@ -781,13 +790,15 @@ def _calibration_quantization(
         [("quantization", _ns_to_ms(t0, t1))],
     )
 
+    return LogicalResult.SUCCESS
+
 
 def _random_quantization(
     input_model: str,
     output_model: str,
     seed: int | None = None,
     perf_out: str = "perf_info.csv",
-):
+) -> LogicalResult:
     t0 = time.perf_counter_ns()
     onnx_model = onnx.load(input_model)
     graph = onnx_model.graph
@@ -816,6 +827,8 @@ def _random_quantization(
             ("quantize", _ns_to_ms(t1, t2)),
         ],
     )
+
+    return LogicalResult.SUCCESS
 
 
 def _parse_args():
@@ -927,7 +940,7 @@ def _parse_args():
     return parser.parse_args()
 
 
-def _main():
+def _main() -> LogicalResult:
     args = _parse_args()
 
     np.random.seed(args.seed)
@@ -939,24 +952,22 @@ def _main():
         source = args.input_file or args.input_dir
         if not source:
             logger.error("--export-input requires --input-file or --input-dir")
-            return 1
+            return LogicalResult.FAILURE
         export_model_input(args.input_model, source, args.export_input, seed=args.seed)
-        return 0
+        return LogicalResult.SUCCESS
 
     if not args.output_model:
-        logger.error(
-            "--output-model is required unless using --export-input or --list-op-types"
-        )
-        return 1
+        logger.error("--output-model is required unless using --export-input or --list-op-types")
+        return LogicalResult.FAILURE
 
     if args.num_inputs < 1:
         logger.error("--num-inputs must be >= 1")
-        return 1
+        return LogicalResult.FAILURE
 
     # TODO: use a Quantizer abstract class?
     match args.method:
         case QuantMethod.vishap:
-            _vishap_quantization(
+            return _vishap_quantization(
                 args.input_model,
                 args.output_model,
                 args.input_file,
@@ -972,16 +983,16 @@ def _main():
                     "Mixed quantization requires exactly one of "
                     "--preload-ratio or --vishap-op-type"
                 )
-                return 1
+                return LogicalResult.FAILURE
             if args.preload_ratio is not None and not 0.0 <= args.preload_ratio <= 1.0:
                 logger.error("--preload-ratio must be in [0, 1]")
-                return 1
+                return LogicalResult.FAILURE
             if args.num_inputs > 1:
                 logger.error(
                     "Mixed quantization uses a single input; do not set --num-inputs > 1"
                 )
-                return 1
-            _mixed_quantization(
+                return LogicalResult.FAILURE
+            return _mixed_quantization(
                 args.input_model,
                 args.output_model,
                 args.input_file,
@@ -995,8 +1006,8 @@ def _main():
         case QuantMethod.calibration:
             if not args.input_dir:
                 logger.error("Calibration quantization requires --input-dir")
-                return 1
-            _calibration_quantization(
+                return LogicalResult.FAILURE
+            return _calibration_quantization(
                 args.input_model,
                 args.output_model,
                 args.input_dir,
@@ -1004,14 +1015,12 @@ def _main():
                 args.perf_out,
             )
         case QuantMethod.random:
-            _random_quantization(
+            return _random_quantization(
                 args.input_model, args.output_model, args.seed, args.perf_out
             )
         case _:
             logger.error(f"Invalid quantization method: {args.method}")
-            return 1
-
-    return 0
+            return LogicalResult.FAILURE
 
 
 if __name__ == "__main__":

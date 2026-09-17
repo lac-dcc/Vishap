@@ -1,8 +1,14 @@
+import io
+import logging
 import numpy as np
 import os
+import shlex
 import sys
 from pathlib import Path
 from PIL import Image
+
+logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 Stats = tuple[np.float64, np.float64, np.float64, np.float64]
 ROOT_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
@@ -98,22 +104,60 @@ def parse_vishap_module(module_asm: bytes | str):
         return Module.parse(module_asm)
 
 
+def _dump_vishap_opt_repro(bytecode: bytes, pipeline: str, description: str) -> None:
+    """Write IR captured before a failed pipeline and log a vishap-opt command."""
+    dump_name = description.replace(" ", "-") or "pipeline"
+    dump_path = TMP_DIR / f"{dump_name}.mlirbc"
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    dump_path.write_bytes(bytecode)
+
+    opt = BUILD_DIR / "bin" / "vishap-opt"
+    pipeline_arg = " ".join(pipeline.split())
+    logger.error(
+        "%s failed. Reproduce with:\n  %s -pass-pipeline=%s %s\n",
+        description,
+        opt,
+        shlex.quote(pipeline_arg),
+        shlex.quote(str(dump_path)),
+    )
+
+
+def run_vishap_pipeline(module, pipeline: str, description: str = "vishap-pipeline"):
+    """Run an MLIR pass pipeline, printing a vishap-opt repro command on failure.
+
+    Serializes ``module`` before running so the dumped IR matches the pipeline
+    input. On failure, writes bytecode under ``TMP_DIR`` and logs a command
+    that can be passed to ``vishap-opt``.
+    """
+    ensure_vishap_bindings_on_path()
+    from vishap.passmanager import PassManager
+
+    buf = io.BytesIO()
+    module.operation.write_bytecode(file=buf)
+
+    try:
+        with module.context:
+            PassManager.parse(pipeline).run(module.operation)
+    except Exception:
+        try:
+            _dump_vishap_opt_repro(buf.getvalue(), pipeline, description)
+        except Exception as dump_err:
+            logger.error("Failed to write vishap-opt repro: %s", dump_err)
+        raise
+
+
 def annotate_distributions_on_module(module, input_stats: list[Stats]):
     """Run annotate-distributions in-place on an already-parsed module.
 
     Raises:
         ImportError: If the bindings are not built/importable.
     """
-    ensure_vishap_bindings_on_path()
-    from vishap.passmanager import PassManager
-
     pipeline = (
         "builtin.module(func.func(annotate-distributions{"
         + _stats_to_vishap_arg(input_stats)
         + "}))"
     )
-    with module.context:
-        PassManager.parse(pipeline).run(module.operation)
+    run_vishap_pipeline(module, pipeline, description="annotate-distributions")
 
 
 def annotate_distributions(module_asm: bytes | str, input_stats: list[Stats]):

@@ -13,6 +13,7 @@ from utils import (
     get_array_stats,
     get_llvm_build_dir,
     parse_onnx_loc_name,
+    run_vishap_pipeline,
 )
 
 logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
@@ -33,7 +34,6 @@ try:
         WalkOrder,
         WalkResult,
     )
-    from vishap.passmanager import PassManager
     from vishap.runtime import get_ranked_memref_descriptor, ranked_memref_to_numpy
 except ImportError:
     logger.error(
@@ -406,7 +406,7 @@ def lower_module_to_llvm(module, all_float_ops: bool = False):
         )
     )"""
 
-    PassManager.parse(pipeline).run(module.operation)
+    run_vishap_pipeline(module, pipeline, description="lower-to-llvm")
     entry_func = module.body.operations[0]
     entry_func.operation.attributes["llvm.emit_c_interface"] = UnitAttr.get()
     return module
