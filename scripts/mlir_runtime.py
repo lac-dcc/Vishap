@@ -284,7 +284,7 @@ def attach_tensor_stats_to_ops(
     *,
     node_name_to_op_type: dict[str, str] | None = None,
     vishap_op_type: str | None = None,
-) -> int:
+) -> set[str]:
     """Preload ONNX tensor stats onto a subset of matching MLIR ops.
 
     Selection is either a random ``ratio`` of candidates, or every candidate
@@ -294,7 +294,7 @@ def attach_tensor_stats_to_ops(
 
     An op is a candidate when it is a mixed float op (see
     ``collect_mixed_float_ops``) and every output tensor has an entry in
-    ``tensor_stats``. Returns the number of ops that received
+    ``tensor_stats``. Returns the ONNX node names that received
     ``vishap.distribution``.
     """
     if (ratio is None) == (vishap_op_type is None):
@@ -338,21 +338,23 @@ def attach_tensor_stats_to_ops(
             ratio,
         )
         if n == 0:
-            return 0
+            return set()
         rng = np.random.default_rng(seed)
         chosen = {int(i) for i in rng.choice(len(candidates), size=n, replace=False)}
 
     if n == 0:
-        return 0
+        return set()
 
+    preloaded: set[str] = set()
     with module.context, Location.unknown():
-        for i, (op, dists, _) in enumerate(candidates):
+        for i, (op, dists, onnx_name) in enumerate(candidates):
             if i not in chosen:
                 continue
             op.attributes[VISHAP_DIST_ATTR] = stats_list_to_dist_attr(
                 dists, module.context
             )
-    return n
+            preloaded.add(onnx_name)
+    return preloaded
 
 
 def parse_probe_report(path: Path | str = PROBE_REPORT_PATH) -> list[Stats]:
