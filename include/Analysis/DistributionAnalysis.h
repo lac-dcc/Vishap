@@ -41,11 +41,16 @@ private:
 
   LogicalResult visitDivOp(stablehlo::DivOp divOp);
 
-  /// Propagate distribution for a value that is clamped from below at
-  /// \p clampValue (e.g. ReLU when \p clampValue is 0).
-  LogicalResult visitClamp(Operation *op, Value input, double clampValue);
+  /// Propagate distribution for a value that is clamped to the interval
+  /// [\p lowerBound, \p upperBound] (e.g. ReLU when the interval is
+  /// [0, +inf), ReLU6 when it is [0, 6]). Either bound may be infinite for
+  /// one-sided clamping.
+  LogicalResult visitClamp(Operation *op, Value input, double lowerBound,
+                           double upperBound);
 
   LogicalResult visitMaxOp(stablehlo::MaxOp maxOp);
+
+  LogicalResult visitClampOp(stablehlo::ClampOp clampOp);
 
   /// Propagate distribution for a unary operation that does not change the
   /// distribution of its input (e.g. transpose, reshape, broadcast).
@@ -69,6 +74,8 @@ private:
   LogicalResult visitConcatenate(stablehlo::ConcatenateOp concatOp);
 
   LogicalResult visitExpOp(stablehlo::ExpOp expOp);
+
+  LogicalResult visitRsqrtOp(stablehlo::RsqrtOp rsqrtOp);
 
   LogicalResult visitConvert(stablehlo::ConvertOp convertOp);
 

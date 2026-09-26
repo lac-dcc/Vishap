@@ -89,6 +89,159 @@ Operation *skipReshapeAndBroadcast(Value value) {
   return op;
 }
 
+/// Extract the elements of the dense float constant that defines \p value as
+/// doubles, looking through shape-preserving ops (broadcast, reshape) and
+/// converts. Note that broadcasts do not preserve element multiplicity: the
+/// values of the pre-broadcast constant are returned.
+FailureOr<llvm::SmallVector<double>> getConstantTensorValues(Value value) {
+  auto valueAttrOrFailure = getConstantValue(value.getDefiningOp());
+  if (failed(valueAttrOrFailure)) {
+    return failure();
+  }
+
+  auto denseAttr = llvm::dyn_cast<DenseElementsAttr>(*valueAttrOrFailure);
+  if (!denseAttr) {
+    return failure();
+  }
+
+  Type elementType = denseAttr.getElementType();
+  llvm::SmallVector<double> values;
+  if (elementType.isF32()) {
+    llvm::append_range(
+        values, llvm::map_range(denseAttr.getValues<float>(), [](float v) {
+          return static_cast<double>(v);
+        }));
+  } else if (elementType.isF64()) {
+    llvm::append_range(values, denseAttr.getValues<double>());
+  } else {
+    return failure();
+  }
+  return values;
+}
+
+/// Result of matching a stablehlo.rsqrt over a constant expression:
+/// rsqrt(values + epsilon).
+struct ConstantRsqrtInfo {
+  /// Per-element values of the constant operand (before the epsilon addition).
+  llvm::SmallVector<double> values;
+  /// Scalar added to the values before the rsqrt (0 if there is no addition).
+  /// In a batch normalization this is the numerical-stability constant
+  /// (typically ~1e-5) added to the running variance before taking
+  /// 1/sqrt(var + eps), so that channels with near-zero variance do not
+  /// produce a division by zero / huge scale factor.
+  double epsilon;
+};
+
+/// Match a stablehlo.rsqrt whose operand is a constant expression: either a
+/// plain constant, or add(const, splat_const) as produced by decomposed batch
+/// normalizations (rsqrt(running_var + eps)). Fails if any element of
+/// values + epsilon is not strictly positive and finite.
+FailureOr<ConstantRsqrtInfo> matchConstantRsqrt(stablehlo::RsqrtOp rsqrtOp) {
+  Value operand = rsqrtOp.getOperand();
+
+  ConstantRsqrtInfo info;
+  auto directOrFailure = getConstantTensorValues(operand);
+  if (succeeded(directOrFailure)) {
+    info.values = std::move(*directOrFailure);
+    info.epsilon = 0.0;
+  } else {
+    auto addOp =
+        llvm::dyn_cast_or_null<stablehlo::AddOp>(operand.getDefiningOp());
+    if (!addOp) {
+      return failure();
+    }
+
+    // One operand is a dense constant, the other a scalar/splat epsilon. Try
+    // both orders (the choice does not matter mathematically if both succeed).
+    bool matched = false;
+    for (auto [vectorVal, scalarVal] :
+         {std::make_pair(addOp.getLhs(), addOp.getRhs()),
+          std::make_pair(addOp.getRhs(), addOp.getLhs())}) {
+      auto epsOrFailure = getScalarConstantValue(scalarVal);
+      auto valuesOrFailure = getConstantTensorValues(vectorVal);
+      if (failed(epsOrFailure) || failed(valuesOrFailure)) {
+        continue;
+      }
+      info.values = std::move(*valuesOrFailure);
+      info.epsilon = *epsOrFailure;
+      matched = true;
+      break;
+    }
+    if (!matched) {
+      return failure();
+    }
+  }
+
+  if (info.values.empty() || llvm::any_of(info.values, [&](double v) {
+        double sum = v + info.epsilon;
+        return !std::isfinite(sum) || sum <= 0.0;
+      })) {
+    return failure();
+  }
+
+  return info;
+}
+
+/// Result of matching the normalization multiply of a decomposed batch
+/// normalization.
+///
+/// The full per-channel vectors are kept (rather than their summary
+/// statistics) because the transfer function needs channel-wise *pairs*
+/// (mean_c, variance_c): the output extrema and the mixture variance
+/// E_c[v_c / (v_c + eps)] pair each channel's mean with that same channel's
+/// variance, a correspondence that cannot be reconstructed from aggregate
+/// statistics of the two tensors.
+struct BatchNormNormalizeInfo {
+  /// The activation being normalized.
+  Value input;
+  /// Per-channel running means stored in the graph.
+  llvm::SmallVector<double> means;
+  /// Per-channel running variances stored in the graph.
+  llvm::SmallVector<double> variances;
+  /// Numerical-stability constant (typically ~1e-5) added to the running
+  /// variance before the rsqrt, so channels with near-zero variance do not
+  /// produce a division by zero / huge scale factor.
+  double epsilon;
+};
+
+/// Match the normalization multiply of a decomposed batch normalization:
+///   mul(sub(x, bcast(mean_const)), bcast(rsqrt(var_const + eps)))
+/// in either operand order.
+FailureOr<BatchNormNormalizeInfo>
+matchBatchNormNormalize(stablehlo::MulOp mulOp) {
+  for (auto [subValue, rsqrtValue] :
+       {std::make_pair(mulOp.getLhs(), mulOp.getRhs()),
+        std::make_pair(mulOp.getRhs(), mulOp.getLhs())}) {
+    auto rsqrtOp = llvm::dyn_cast_or_null<stablehlo::RsqrtOp>(
+        skipReshapeAndBroadcast(rsqrtValue));
+    if (!rsqrtOp) {
+      continue;
+    }
+
+    auto subOp =
+        llvm::dyn_cast_or_null<stablehlo::SubtractOp>(subValue.getDefiningOp());
+    if (!subOp) {
+      continue;
+    }
+
+    auto rsqrtInfoOrFailure = matchConstantRsqrt(rsqrtOp);
+    if (failed(rsqrtInfoOrFailure)) {
+      continue;
+    }
+
+    auto meansOrFailure = getConstantTensorValues(subOp.getRhs());
+    if (failed(meansOrFailure) ||
+        meansOrFailure->size() != rsqrtInfoOrFailure->values.size()) {
+      continue;
+    }
+
+    return BatchNormNormalizeInfo{subOp.getLhs(), std::move(*meansOrFailure),
+                                  std::move(rsqrtInfoOrFailure->values),
+                                  rsqrtInfoOrFailure->epsilon};
+  }
+  return failure();
+}
+
 /// Check if \p divOp corresponds to a softmax/L1-normalize: x /
 /// broadcast(sum(x)). Looks through reshape and broadcast on the divisor. On
 /// success, returns the number of elements folded into each sum (e.g., the
@@ -319,6 +472,44 @@ DistributionAnalysis::visitSubtractOp(stablehlo::SubtractOp subOp) {
 }
 
 LogicalResult DistributionAnalysis::visitMulOp(stablehlo::MulOp mulOp) {
+  // Normalization multiply of a decomposed batch normalization:
+  //   (x - mean) * rsqrt(var + eps).
+  // Instead of applying the abstract product transfer function, propagate the
+  // running statistics stored in the graph: per channel c, x is described by
+  // mean m_c and variance v_c, so the normalized activation has mean 0 and
+  // variance v_c / (v_c + eps) (approximately 1). Min/max are computed per
+  // channel from the analyzed global range of x.
+  auto bnOrFailure = matchBatchNormNormalize(mulOp);
+  if (succeeded(bnOrFailure)) {
+    auto inputDistOrFailure = getDistribution(bnOrFailure->input);
+    if (failed(inputDistOrFailure)) {
+      return mulOp.emitError()
+             << "Missing distribution info for batch-normalization input.";
+    }
+    const auto *inputDist = *inputDistOrFailure;
+
+    double min = std::numeric_limits<double>::infinity();
+    double max = -std::numeric_limits<double>::infinity();
+    double varianceSum = 0.0;
+    for (auto [m, v] : llvm::zip(bnOrFailure->means, bnOrFailure->variances)) {
+      double r = 1.0 / std::sqrt(v + bnOrFailure->epsilon);
+      // r > 0, so the channel extrema come from the extrema of x.
+      min = std::min(min, (inputDist->min - m) * r);
+      max = std::max(max, (inputDist->max - m) * r);
+      varianceSum += v * r * r;
+    }
+
+    Distribution outputDist{.min = min,
+                            .max = max,
+                            .mean = 0.0,
+                            .variance =
+                                varianceSum /
+                                static_cast<double>(bnOrFailure->means.size())};
+
+    this->registerDistributions(mulOp, {outputDist});
+    return success();
+  }
+
   auto lhsDistOrFailure = getDistribution(mulOp.getLhs());
   auto rhsDistOrFailure = getDistribution(mulOp.getRhs());
   if (failed(lhsDistOrFailure) || failed(rhsDistOrFailure)) {
@@ -414,50 +605,95 @@ LogicalResult DistributionAnalysis::visitDivOp(stablehlo::DivOp divOp) {
 }
 
 LogicalResult DistributionAnalysis::visitClamp(Operation *op, Value input,
-                                               double clampValue) {
+                                               double lowerBound,
+                                               double upperBound) {
   auto inputDistOrFailure = getDistribution(input);
   if (failed(inputDistOrFailure)) {
     return op->emitError() << "Missing distribution info for input.";
   }
 
+  if (lowerBound > upperBound) {
+    return op->emitError() << "Clamp lower bound (" << lowerBound
+                           << ") is greater than upper bound (" << upperBound
+                           << ")";
+  }
+
   const auto *inputDist = *inputDistOrFailure;
 
+  // Model the input as X ~ N(mu, sigma^2) and the output as the winsorized
+  // variable Y = clamp(X, lo, hi). With alpha = (lo - mu)/sigma and
+  // beta = (hi - mu)/sigma, the moments of Y have a closed form in terms of
+  // the standard normal CDF Phi and PDF phi:
+  //   P(X < lo) = Phi(alpha),  P(X > hi) = 1 - Phi(beta)
+  //   E[X * 1{lo<X<hi}]   = mu*pMid - sigma*(phi(beta) - phi(alpha))
+  //   E[X^2 * 1{lo<X<hi}] = (mu^2 + sigma^2)*pMid
+  //                         - sigma^2*(beta*phi(beta) - alpha*phi(alpha))
+  //                         - 2*mu*sigma*(phi(beta) - phi(alpha))
+  // where pMid = Phi(beta) - Phi(alpha). Infinite bounds reduce to one-sided
+  // clamping (e.g. ReLU when lo = 0 and hi = +inf).
+  double mu = inputDist->mean;
   double sigma = std::sqrt(inputDist->variance);
-  double alpha = (clampValue - inputDist->mean) / sigma;
 
-  // 1. Calculate probabilities (CDF and PDF)
-  double cdf = 0.5 * (1 + std::erf(alpha / std::sqrt(2)));
-  double pdf = (1 / std::sqrt(2 * M_PI)) * std::exp(-0.5 * alpha * alpha);
+  auto stdNormalCdf = [](double z) {
+    return 0.5 * (1 + std::erf(z / std::sqrt(2)));
+  };
+  auto stdNormalPdf = [](double z) {
+    return (1 / std::sqrt(2 * M_PI)) * std::exp(-0.5 * z * z);
+  };
 
-  double clampProb = cdf;
-  double tailProb = 1 - cdf;
+  // Handle infinite bounds explicitly: beta*phi(beta) would evaluate to
+  // inf * 0 = NaN numerically, even though its limit is 0.
+  double cdfLo = 0.0, pdfLo = 0.0, alphaPdfLo = 0.0;
+  if (std::isfinite(lowerBound)) {
+    double alpha = (lowerBound - mu) / sigma;
+    cdfLo = stdNormalCdf(alpha);
+    pdfLo = stdNormalPdf(alpha);
+    alphaPdfLo = alpha * pdfLo;
+  }
 
-  // 2. Calculate tail statistics
-  // Inverse Millis ratio
-  double lam = pdf / tailProb;
-  double tailMean = inputDist->mean + (sigma * lam);
-  double delta = lam * (lam - alpha);
-  double tailVariance = inputDist->variance * (1 - delta);
+  double cdfHi = 1.0, pdfHi = 0.0, betaPdfHi = 0.0;
+  if (std::isfinite(upperBound)) {
+    double beta = (upperBound - mu) / sigma;
+    cdfHi = stdNormalCdf(beta);
+    pdfHi = stdNormalPdf(beta);
+    betaPdfHi = beta * pdfHi;
+  }
 
-  // 3. Combine moments
-  // New mean E[X]
-  double rectifiedMean = (clampProb * clampValue) + (tailProb * tailMean);
+  // Probability of landing below, inside, and above the clamping interval.
+  double probLo = cdfLo;
+  double probHi = 1.0 - cdfHi;
+  double probMid = cdfHi - cdfLo;
 
-  // Second moment E[X^2]
-  // For the tail part, E[X^2] = Var + Mean^2
-  double tailSecondMoment = tailVariance + (tailMean * tailMean);
-  // For the clamped part, E[X^2] = C^2
-  double rectifiedSecondMoment =
-      (clampProb * (clampValue * clampValue)) + (tailProb * tailSecondMoment);
+  // Partial first and second moments of X over the interval (lo, hi).
+  double midMean = mu * probMid - sigma * (pdfHi - pdfLo);
+  double midSecondMoment = (mu * mu + sigma * sigma) * probMid -
+                           sigma * sigma * (betaPdfHi - alphaPdfLo) -
+                           2 * mu * sigma * (pdfHi - pdfLo);
 
-  // Variance Var[X] = E[X^2] - (E[X])^2
-  double rectifiedVariance =
-      rectifiedSecondMoment - (rectifiedMean * rectifiedMean);
+  // Combine with the point masses at the bounds. Infinite bounds carry zero
+  // probability, so their (otherwise non-finite) contributions are dropped.
+  double clampedMean = midMean;
+  double clampedSecondMoment = midSecondMoment;
+  if (std::isfinite(lowerBound)) {
+    clampedMean += probLo * lowerBound;
+    clampedSecondMoment += probLo * lowerBound * lowerBound;
+  }
+  if (std::isfinite(upperBound)) {
+    clampedMean += probHi * upperBound;
+    clampedSecondMoment += probHi * upperBound * upperBound;
+  }
 
-  Distribution outputDist = {.min = std::max(inputDist->min, clampValue),
-                             .max = std::max(inputDist->max, clampValue),
-                             .mean = rectifiedMean,
-                             .variance = rectifiedVariance};
+  // Var[Y] = E[Y^2] - E[Y]^2. Guard against small negative values caused by
+  // floating-point cancellation.
+  double clampedVariance =
+      std::max(0.0, clampedSecondMoment - clampedMean * clampedMean);
+
+  // clamp is monotone, so the output extrema are the clamped input extrema.
+  Distribution outputDist = {
+      .min = std::min(std::max(inputDist->min, lowerBound), upperBound),
+      .max = std::min(std::max(inputDist->max, lowerBound), upperBound),
+      .mean = clampedMean,
+      .variance = clampedVariance};
 
   this->registerDistributions(op, {outputDist});
 
@@ -467,20 +703,40 @@ LogicalResult DistributionAnalysis::visitClamp(Operation *op, Value input,
 LogicalResult DistributionAnalysis::visitMaxOp(stablehlo::MaxOp maxOp) {
   // A maximum against a constant is a clamp from below (e.g. ReLU when the
   // constant is 0).
+  constexpr double inf = std::numeric_limits<double>::infinity();
   auto lhsConstOrFailure = getScalarConstantValue(maxOp.getLhs());
   auto rhsConstOrFailure = getScalarConstantValue(maxOp.getRhs());
 
   if (succeeded(rhsConstOrFailure)) {
-    return visitClamp(maxOp, maxOp.getLhs(), *rhsConstOrFailure);
+    return visitClamp(maxOp, maxOp.getLhs(), *rhsConstOrFailure, inf);
   }
 
   if (succeeded(lhsConstOrFailure)) {
-    return visitClamp(maxOp, maxOp.getRhs(), *lhsConstOrFailure);
+    return visitClamp(maxOp, maxOp.getRhs(), *lhsConstOrFailure, inf);
   }
 
   return maxOp.emitError()
          << "Expected one of the operands of stablehlo.maximum to be a "
             "scalar or splat float constant";
+}
+
+LogicalResult DistributionAnalysis::visitClampOp(stablehlo::ClampOp clampOp) {
+  auto lowerOrFailure = getScalarConstantValue(clampOp.getMin());
+  if (failed(lowerOrFailure)) {
+    return clampOp.emitError()
+           << "Expected the min operand of stablehlo.clamp to be a scalar or "
+              "splat float constant";
+  }
+
+  auto upperOrFailure = getScalarConstantValue(clampOp.getMax());
+  if (failed(upperOrFailure)) {
+    return clampOp.emitError()
+           << "Expected the max operand of stablehlo.clamp to be a scalar or "
+              "splat float constant";
+  }
+
+  return visitClamp(clampOp, clampOp.getOperand(), *lowerOrFailure,
+                    *upperOrFailure);
 }
 
 LogicalResult DistributionAnalysis::visitUnaryIdentityOp(Operation *op) {
@@ -809,6 +1065,43 @@ LogicalResult DistributionAnalysis::visitExpOp(stablehlo::ExpOp expOp) {
   return success();
 }
 
+LogicalResult DistributionAnalysis::visitRsqrtOp(stablehlo::RsqrtOp rsqrtOp) {
+  auto inputDistOrFailure = getDistribution(rsqrtOp.getOperand());
+  if (failed(inputDistOrFailure)) {
+    return rsqrtOp.emitError() << "Missing distribution info for input.";
+  }
+  const auto *inputDist = *inputDistOrFailure;
+
+  // rsqrt is only real-valued and bounded for strictly positive inputs.
+  if (inputDist->min <= 0.0) {
+    return rsqrtOp.emitError()
+           << "stablehlo.rsqrt over a range that contains values <= 0 is not "
+              "supported in distribution analysis";
+  }
+
+  // rsqrt is monotonically decreasing, so the interval endpoints swap. For the
+  // moments, use a second-order Taylor expansion (delta method) of
+  // g(X) = X^(-1/2) around the mean mu, with g'(x) = -x^(-3/2)/2 and
+  // g''(x) = 3*x^(-5/2)/4:
+  //   E[g(X)]   ~= g(mu) + g''(mu)/2 * sigma^2
+  //             =  mu^(-1/2) * (1 + 3*sigma^2 / (8*mu^2))
+  //   Var[g(X)] ~= g'(mu)^2 * sigma^2 = sigma^2 / (4*mu^3)
+  // Caveat: this approximation is only accurate when the coefficient of
+  // variation sigma/mu is small; for widely spread inputs it can severely
+  // underestimate the moments.
+  double mu = inputDist->mean;
+  double sigmaSq = inputDist->variance;
+  Distribution outputDist;
+  outputDist.min = 1.0 / std::sqrt(inputDist->max);
+  outputDist.max = 1.0 / std::sqrt(inputDist->min);
+  outputDist.mean =
+      (1.0 / std::sqrt(mu)) * (1.0 + 3.0 * sigmaSq / (8.0 * mu * mu));
+  outputDist.variance = sigmaSq / (4.0 * mu * mu * mu);
+
+  this->registerDistributions(rsqrtOp, {outputDist});
+  return success();
+}
+
 LogicalResult
 DistributionAnalysis::visitConvert(stablehlo::ConvertOp convertOp) {
   auto result = convertOp.getResult();
@@ -883,7 +1176,8 @@ LogicalResult DistributionAnalysis::visitPreloadedOperation(Operation *op) {
 
   auto distAttr = op->getAttrOfType<ArrayAttr>(kDistributionAttrName);
   if (!distAttr || distAttr.size() != op->getNumResults()) {
-    return op->emitError() << "Invalid " << kDistributionAttrName << " attribute";
+    return op->emitError() << "Invalid " << kDistributionAttrName
+                           << " attribute";
   }
 
   for (size_t i = 0; i < distAttr.size(); i++) {
@@ -920,6 +1214,8 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
           [&](stablehlo::DivOp divOp) { return visitDivOp(divOp); })
       .Case<stablehlo::MaxOp>(
           [&](stablehlo::MaxOp maxOp) { return visitMaxOp(maxOp); })
+      .Case<stablehlo::ClampOp>(
+          [&](stablehlo::ClampOp clampOp) { return visitClampOp(clampOp); })
       .Case<stablehlo::BroadcastInDimOp, stablehlo::TransposeOp,
             stablehlo::ReshapeOp, stablehlo::SliceOp, stablehlo::GatherOp>(
           [&](Operation *identityOp) {
@@ -945,6 +1241,8 @@ LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
       })
       .Case<stablehlo::ExpOp>(
           [&](stablehlo::ExpOp expOp) { return visitExpOp(expOp); })
+      .Case<stablehlo::RsqrtOp>(
+          [&](stablehlo::RsqrtOp rsqrtOp) { return visitRsqrtOp(rsqrtOp); })
       .Case<stablehlo::ConvertOp>([&](stablehlo::ConvertOp convertOp) {
         return visitConvert(convertOp);
       })
