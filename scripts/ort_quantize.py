@@ -30,6 +30,7 @@ from mlir_runtime import CONSTANT_OP_NAMES, mixed_candidate_op_types
 from utils import (
     Stats,
     TMP_DIR,
+    VISHAP_AXIS_DIST_ATTR,
     VISHAP_DIST_ATTR,
     annotate_distributions,
     annotate_distributions_on_module,
@@ -256,16 +257,144 @@ def _get_onnx_node_names(onnx_model: onnx.ModelProto) -> list[str]:
     return node_names
 
 
-def _vishap_dist_to_tensor_quant(
-    lambd, stats: Stats, *, use_real_minmax: bool = False
-) -> list[dict[str, np.float32]]:
+# Slice distributions for one result: one list per axis. An empty list means
+# that axis is uniform (every slice matches the per-tensor summary).
+ResultAxes = list[list[Stats]]
+
+
+def _parse_stats_attr(dist) -> Stats:
+    """Read one ``[min, max, mean, variance]`` distribution attribute."""
+    vals = [np.float64(val) for val in dist]
+    if len(vals) != 4:
+        raise ValueError(f"expected 4 distribution values, got {len(vals)}")
+    return (vals[0], vals[1], vals[2], vals[3])
+
+
+def _parse_result_axes(result_axes) -> ResultAxes:
+    """Read one result's per-axis slice distributions."""
+    return [
+        [_parse_stats_attr(slice_dist) for slice_dist in axis] for axis in result_axes
+    ]
+
+
+def _lambda_clip(lambd: int, stats: Stats) -> tuple[float, float]:
+    """Clip ``stats`` to ``mean ± λ√variance``, intersected with ``[min, max]``."""
     min_est, max_est, mean_est, var_est = stats
+    if var_est < 0 or not np.isfinite(var_est):
+        return np.nan, np.nan
+    std = np.sqrt(var_est)
+    lowest = max(min_est, mean_est - lambd * std)
+    highest = min(max_est, mean_est + lambd * std)
+    return float(lowest), float(highest)
+
+
+def _most_informative_axis(axes: ResultAxes) -> int | None:
+    """Axis with the largest variance of slice means, matching the analysis.
+
+    Non-finite scores are ignored. Uniform (empty) axes are skipped.
+    """
+    best: int | None = None
+    best_score = -1.0
+    for axis, slices in enumerate(axes):
+        if not slices:
+            continue
+        means = np.array([s[2] for s in slices], dtype=np.float64)
+        with np.errstate(over="ignore", invalid="ignore"):
+            score = float(means.var())
+        if not np.isfinite(score):
+            continue
+        if best is None or score > best_score:
+            best = axis
+            best_score = score
+    return best
+
+
+def _finite_float32_bounds(low: float, high: float) -> tuple[np.float32, np.float32] | None:
+    """Clamp an ordered interval into the finite float32 range.
+
+    Non-finite or inverted bounds are unusable. ORT stores activation ranges
+    as float32 and rejects a NaN scale.
+    """
+    if not np.isfinite(low) or not np.isfinite(high) or low > high:
+        return None
+    limit = float(np.finfo(np.float32).max)
+    return np.float32(min(max(low, -limit), limit)), np.float32(
+        min(max(high, -limit), limit)
+    )
+
+
+def _summary_quant_range(
+    lambd: int, stats: Stats, *, use_real_minmax: bool
+) -> tuple[float, float]:
+    min_est, max_est, _, _ = stats
     if use_real_minmax:
-        lowest, highest = min_est, max_est
-    else:
-        lowest = max(min_est, mean_est - lambd * np.sqrt(var_est))
-        highest = min(max_est, mean_est + lambd * np.sqrt(var_est))
-    return [{"rmin": np.float32(lowest), "rmax": np.float32(highest)}]
+        return float(min_est), float(max_est)
+    return _lambda_clip(lambd, stats)
+
+
+def _range_from_axes(
+    lambd: int, stats: Stats, axes: ResultAxes | None, *, use_real_minmax: bool
+) -> tuple[float, float, bool]:
+    """Return ``(rmin, rmax, used_per_axis)``.
+
+    Measured ranges keep the summary min/max. Estimated ranges use the union
+    of per-slice lambda clips on the most informative axis, falling back to
+    the summary clip when that axis is missing or the union is unusable.
+    """
+    summary_low, summary_high = _summary_quant_range(
+        lambd, stats, use_real_minmax=use_real_minmax
+    )
+    if use_real_minmax or not axes:
+        return summary_low, summary_high, False
+
+    axis = _most_informative_axis(axes)
+    if axis is None:
+        return summary_low, summary_high, False
+
+    lows: list[float] = []
+    highs: list[float] = []
+    for slice_stats in axes[axis]:
+        low, high = _lambda_clip(lambd, slice_stats)
+        if not np.isfinite(low) or not np.isfinite(high) or low > high:
+            continue
+        lows.append(low)
+        highs.append(high)
+    if not lows:
+        return summary_low, summary_high, False
+
+    lowest = min(lows)
+    highest = max(highs)
+    if (
+        not np.isfinite(lowest)
+        or not np.isfinite(highest)
+        or lowest > highest
+    ):
+        return summary_low, summary_high, False
+    return lowest, highest, True
+
+
+def _vishap_dist_to_tensor_quant(
+    lambd,
+    stats: Stats,
+    *,
+    use_real_minmax: bool = False,
+    axes: ResultAxes | None = None,
+) -> tuple[list[dict[str, np.float32]], bool]:
+    """Map one distribution to an ORT per-tensor ``rmin``/``rmax`` override.
+
+    The bool is true when the range came from per-axis slice clips.
+    """
+    lowest, highest, used_per_axis = _range_from_axes(
+        lambd, stats, axes, use_real_minmax=use_real_minmax
+    )
+    bounds = _finite_float32_bounds(lowest, highest)
+    if bounds is None:
+        bounds = _finite_float32_bounds(float(stats[0]), float(stats[1]))
+        used_per_axis = False
+    if bounds is None:
+        bounds = (np.float32(0), np.float32(0))
+        used_per_axis = False
+    return [{"rmin": bounds[0], "rmax": bounds[1]}], used_per_axis
 
 
 def _ns_to_ms(start_ns: int, end_ns: int) -> float:
@@ -290,14 +419,19 @@ def _save_perf_stages(
 
 def _collect_vishap_dists(
     mlir_module, valid_onnx_names: set[str]
-) -> tuple[dict[str, list[Stats]], list[Stats], set[str]]:
-    """Walk an annotated MLIR module and return node stats, entry output stats, and constant names.
+) -> tuple[dict[str, list[Stats]], dict[str, list[ResultAxes]], list[Stats], set[str]]:
+    """Walk an annotated MLIR module and return node stats, axes, outputs, and constants.
+
+    Per-result summaries come from ``vishap.distribution``. When
+    ``vishap.axis_distribution`` is present and has one entry per summary, it
+    is returned in parallel; otherwise that node falls back to summaries only.
 
     The constant-name set contains ONNX loc names whose MLIR op is in
     ``CONSTANT_OP_NAMES`` (``stablehlo.constant`` / ``arith.constant``).
     """
 
     onnx_name_to_dists: dict[str, list[Stats]] = {}
+    onnx_name_to_axes: dict[str, list[ResultAxes]] = {}
     func_output_stats: list[Stats] = []
     constant_onnx_names: set[str] = set()
 
@@ -311,20 +445,49 @@ def _collect_vishap_dists(
         if onnx_name not in valid_onnx_names:
             continue
 
-        onnx_name_to_dists[onnx_name] = [
-            tuple(np.float64(val) for val in dist)
+        summaries = [
+            _parse_stats_attr(dist)
             for dist in op.operation.attributes[VISHAP_DIST_ATTR]
         ]
+        onnx_name_to_dists[onnx_name] = summaries
+        # A later op with the same loc replaces the summaries, so drop any
+        # axes collected from the previous one unless this op has its own.
+        onnx_name_to_axes.pop(onnx_name, None)
+        if VISHAP_AXIS_DIST_ATTR in op.attributes:
+            try:
+                parsed_axes = [
+                    _parse_result_axes(result_axes)
+                    for result_axes in op.operation.attributes[VISHAP_AXIS_DIST_ATTR]
+                ]
+            except (TypeError, ValueError) as exc:
+                logger.warning(
+                    "Ignoring axis distributions for %s: %s", onnx_name, exc
+                )
+            else:
+                if len(parsed_axes) != len(summaries):
+                    logger.warning(
+                        "Ignoring axis distributions for %s: %d result(s) vs %d summary(s)",
+                        onnx_name,
+                        len(parsed_axes),
+                        len(summaries),
+                    )
+                else:
+                    onnx_name_to_axes[onnx_name] = parsed_axes
         if op.name in CONSTANT_OP_NAMES:
             constant_onnx_names.add(onnx_name)
 
     if VISHAP_DIST_ATTR in entry_func.attributes:
         func_output_stats = [
-            tuple(np.float64(val) for val in dist)
+            _parse_stats_attr(dist)
             for dist in entry_func.operation.attributes[VISHAP_DIST_ATTR]
         ]
 
-    return onnx_name_to_dists, func_output_stats, constant_onnx_names
+    return (
+        onnx_name_to_dists,
+        onnx_name_to_axes,
+        func_output_stats,
+        constant_onnx_names,
+    )
 
 
 def _annotate_module_in_memory(mlir_module, input_stats: list[Stats]):
@@ -339,7 +502,9 @@ def _annotate_module_in_memory(mlir_module, input_stats: list[Stats]):
     buf = io.BytesIO()
     mlir_module.operation.write_bytecode(file=buf)
     try:
-        return annotate_distributions(buf.getvalue(), input_stats)
+        return annotate_distributions(
+            buf.getvalue(), input_stats, annotate_axes=True
+        )
     except ImportError:
         logger.error(
             "Unable to import Vishap Python bindings. Make sure to build Vishap with bindings enabled."
@@ -349,9 +514,29 @@ def _annotate_module_in_memory(mlir_module, input_stats: list[Stats]):
         raise
 
 
+def _producer_result_axes(
+    producer: str | None,
+    output_name: str,
+    node_name_to_outputs: dict[str, list[str]],
+    onnx_name_to_axes: dict[str, list[ResultAxes]],
+) -> ResultAxes | None:
+    """Axis distributions for ``output_name`` on its producing ONNX node."""
+    if producer is None:
+        return None
+    result_axes = onnx_name_to_axes.get(producer)
+    outputs = node_name_to_outputs.get(producer, [])
+    if result_axes is None or output_name not in outputs:
+        return None
+    out_idx = outputs.index(output_name)
+    if out_idx >= len(result_axes):
+        return None
+    return result_axes[out_idx]
+
+
 def _build_tensor_quant_overrides(
     onnx_model: onnx.ModelProto,
     onnx_name_to_dists: dict[str, list[Stats]],
+    onnx_name_to_axes: dict[str, list[ResultAxes]],
     func_output_stats: list[Stats],
     input_stats: Stats,
     lambd: int,
@@ -365,6 +550,10 @@ def _build_tensor_quant_overrides(
     use measured min/max. Passing the set (including an empty one) also marks
     the model input as measured. ``None`` is the Vishap-only path, which keeps
     the lambda clip for every non-constant.
+
+    Estimated ranges use per-axis slice clips when ``onnx_name_to_axes`` has a
+    non-uniform axis for that result. The function's own distribution attribute
+    is summary-only, so graph outputs reuse the producing node's axes.
     """
     # Map ONNX node names (from MLIR locs) to actual output tensor names.
     # TensorQuantOverrides keys must be tensor names, not node names / ":0" ports.
@@ -383,9 +572,12 @@ def _build_tensor_quant_overrides(
         real_minmax_names = constant_names | calibrated_onnx_names
 
     injected_stats: dict[str, list[dict[str, np.float32]]] = {}
+    # Final source per tensor name, so graph-output overwrites are counted once.
+    used_per_axis: dict[str, bool] = {}
     for node_name, out_stats in onnx_name_to_dists.items():
         outputs = node_name_to_outputs.get(node_name, [])
         use_real_minmax = node_name in real_minmax_names
+        node_axes = onnx_name_to_axes.get(node_name)
         for idx, stats in enumerate(out_stats):
             if idx >= len(outputs):
                 logger.warning(
@@ -395,23 +587,42 @@ def _build_tensor_quant_overrides(
                     len(outputs),
                 )
                 continue
-            injected_stats[outputs[idx]] = _vishap_dist_to_tensor_quant(
-                lambd, stats, use_real_minmax=use_real_minmax
+            axes = (
+                node_axes[idx]
+                if node_axes is not None and idx < len(node_axes)
+                else None
             )
+            quant, from_axes = _vishap_dist_to_tensor_quant(
+                lambd, stats, use_real_minmax=use_real_minmax, axes=axes
+            )
+            injected_stats[outputs[idx]] = quant
+            used_per_axis[outputs[idx]] = from_axes
 
     input_name = onnx_model.graph.input[0].name
     output_names = [out.name for out in onnx_model.graph.output]
-    injected_stats[input_name] = _vishap_dist_to_tensor_quant(
+    input_quant, input_from_axes = _vishap_dist_to_tensor_quant(
         lambd, input_stats, use_real_minmax=calibrated_onnx_names is not None
     )
+    injected_stats[input_name] = input_quant
+    used_per_axis[input_name] = input_from_axes
     for output_name, stats in zip(output_names, func_output_stats):
         producer = output_to_producer.get(output_name)
-        injected_stats[output_name] = _vishap_dist_to_tensor_quant(
-            lambd,
-            stats,
-            use_real_minmax=producer is not None and producer in real_minmax_names,
+        use_real_minmax = producer is not None and producer in real_minmax_names
+        axes = _producer_result_axes(
+            producer, output_name, node_name_to_outputs, onnx_name_to_axes
         )
+        quant, from_axes = _vishap_dist_to_tensor_quant(
+            lambd, stats, use_real_minmax=use_real_minmax, axes=axes
+        )
+        injected_stats[output_name] = quant
+        used_per_axis[output_name] = from_axes
 
+    per_axis_count = sum(used_per_axis.values())
+    logger.info(
+        "Quant ranges: %d from per-axis slice clips, %d from per-tensor summary",
+        per_axis_count,
+        len(used_per_axis) - per_axis_count,
+    )
     return injected_stats
 
 
@@ -653,13 +864,17 @@ def _quantize_with_vishap_dists(
 ) -> list[tuple[str, float]]:
     t0 = time.perf_counter_ns()
     valid_onnx_names = set(_get_onnx_node_names(onnx_model))
-    onnx_name_to_dists, func_output_stats, constant_onnx_names = _collect_vishap_dists(
-        annotated_module, valid_onnx_names
-    )
+    (
+        onnx_name_to_dists,
+        onnx_name_to_axes,
+        func_output_stats,
+        constant_onnx_names,
+    ) = _collect_vishap_dists(annotated_module, valid_onnx_names)
     t1 = time.perf_counter_ns()
     injected_stats = _build_tensor_quant_overrides(
         onnx_model,
         onnx_name_to_dists,
+        onnx_name_to_axes,
         func_output_stats,
         input_stats,
         lambd,
@@ -814,7 +1029,9 @@ def _mixed_quantization(
         logger.info("Preloaded ORT distributions on %d ops", len(preloaded_names))
 
         t4 = time.perf_counter_ns()
-        annotate_distributions_on_module(mixed_module, [input_stats])
+        annotate_distributions_on_module(
+            mixed_module, [input_stats], annotate_axes=True
+        )
         t5 = time.perf_counter_ns()
 
         quant_stages = _quantize_with_vishap_dists(

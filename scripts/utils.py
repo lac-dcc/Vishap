@@ -15,6 +15,7 @@ ROOT_DIR = Path(os.path.dirname(os.path.abspath(__file__))).parent
 BUILD_DIR = ROOT_DIR / "build"
 TMP_DIR = ROOT_DIR / "tmp"
 VISHAP_DIST_ATTR = "vishap.distribution"
+VISHAP_AXIS_DIST_ATTR = "vishap.axis_distribution"
 
 DTYPE_MAP = {
     "f32": np.float32,
@@ -146,27 +147,34 @@ def run_vishap_pipeline(module, pipeline: str, description: str = "vishap-pipeli
         raise
 
 
-def annotate_distributions_on_module(module, input_stats: list[Stats]):
+def annotate_distributions_on_module(
+    module, input_stats: list[Stats], annotate_axes: bool = False
+):
     """Run annotate-distributions in-place on an already-parsed module.
+
+    When ``annotate_axes`` is set, the pass also attaches
+    ``vishap.axis_distribution`` (one list of slice distributions per axis).
 
     Raises:
         ImportError: If the bindings are not built/importable.
     """
-    pipeline = (
-        "builtin.module(func.func(annotate-distributions{"
-        + _stats_to_vishap_arg(input_stats)
-        + "}))"
-    )
+    options = _stats_to_vishap_arg(input_stats)
+    if annotate_axes:
+        options += " annotate-axes=true"
+    pipeline = f"builtin.module(func.func(annotate-distributions{{{options}}}))"
     run_vishap_pipeline(module, pipeline, description="annotate-distributions")
 
 
-def annotate_distributions(module_asm: bytes | str, input_stats: list[Stats]):
+def annotate_distributions(
+    module_asm: bytes | str, input_stats: list[Stats], annotate_axes: bool = False
+):
     """Run the annotate-distributions pass in-process via Python bindings.
 
     Args:
         module_asm: The module to annotate, as in-memory MLIR bytecode
             (bytes) or textual assembly (str).
         input_stats: Distribution stats for each entry function argument.
+        annotate_axes: Also attach per-axis slice distributions.
 
     Raises:
         ImportError: If the Vishap bindings are not built/importable.
@@ -177,7 +185,7 @@ def annotate_distributions(module_asm: bytes | str, input_stats: list[Stats]):
         context alive).
     """
     module = parse_vishap_module(module_asm)
-    annotate_distributions_on_module(module, input_stats)
+    annotate_distributions_on_module(module, input_stats, annotate_axes)
     return module
 
 
