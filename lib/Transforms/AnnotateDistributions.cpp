@@ -73,7 +73,8 @@ public:
       return signalPassFailure();
     }
 
-    DistributionAnalysis analysis;
+    DistributionAnalysis analysis(
+        DistributionAnalysis::Options{.perAxis = perAxis});
     if (failed(analysis.run(func))) {
       return signalPassFailure();
     }
@@ -81,17 +82,36 @@ public:
     // Traverse analyzed operations and annotate with distribution attribute
     for (auto *op : analysis.getAnalyzedOperations()) {
       llvm::SmallVector<Attribute, 3> distributions;
+      llvm::SmallVector<Attribute, 3> axisDistributions;
       for (auto result : op->getResults()) {
-        auto distOrFailure = analysis.getDistribution(result);
+        auto distOrFailure = analysis.getTensorDistribution(result);
         if (failed(distOrFailure)) {
           return signalPassFailure();
         }
+        const TensorDistribution &dist = *(*distOrFailure);
 
-        auto distArray = distributionToArrayAttr(builder, *(*distOrFailure));
+        auto distArray = distributionToArrayAttr(builder, dist.summary);
         distributions.push_back(ArrayAttr::get(ctx, distArray));
+
+        if (annotateAxes) {
+          llvm::SmallVector<Attribute> axes;
+          for (const AxisDistribution &axis : dist.axes) {
+            llvm::SmallVector<Attribute> slices;
+            for (const Distribution &slice : axis.slices) {
+              slices.push_back(ArrayAttr::get(
+                  ctx, distributionToArrayAttr(builder, slice)));
+            }
+            axes.push_back(ArrayAttr::get(ctx, slices));
+          }
+          axisDistributions.push_back(ArrayAttr::get(ctx, axes));
+        }
       }
 
       op->setAttr(kDistributionAttrName, ArrayAttr::get(ctx, distributions));
+      if (annotateAxes) {
+        op->setAttr(kAxisDistributionAttrName,
+                    ArrayAttr::get(ctx, axisDistributions));
+      }
     }
 
     // Annotate function with distribution info for return values, if available
