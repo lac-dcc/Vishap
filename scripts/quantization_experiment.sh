@@ -76,14 +76,16 @@ if [[ ! -d "$val_dir" ]]; then
   exit 1
 fi
 # Single calib image for vishap / mixed (must not appear in val_dir).
+# mixed_agg, vishap_agg, and calibration use the full calib_dir.
 input_image=$(find "$calib_dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | sort | head -1)
 if [[ -z "$input_image" ]]; then
   echo "Error: no images found under $calib_dir" >&2
   exit 1
 fi
-echo "Using calibration image (vishap/mixed): $input_image"
-echo "Using validation set for compare: $val_dir"
 num_images=$(find "$calib_dir" -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \) | wc -l)
+echo "Using calibration image (vishap/mixed): $input_image"
+echo "Using calibration set (vishap_agg/mixed_agg/calibration): $calib_dir ($num_images images)"
+echo "Using validation set for compare: $val_dir"
 
 quantize_script="$root_dir/scripts/ort_quantize.py"
 
@@ -95,6 +97,9 @@ quant_methods=(
   "mixed_0.25|--method mixed --input-file ${input_image} --preload-ratio 0.25 --seed ${seed}"
   "mixed_0.50|--method mixed --input-file ${input_image} --preload-ratio 0.5 --seed ${seed}"
   "mixed_0.75|--method mixed --input-file ${input_image} --preload-ratio 0.75 --seed ${seed}"
+  "mixed_agg_0.25|--method mixed --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.25 --seed ${seed}"
+  "mixed_agg_0.50|--method mixed --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.5 --seed ${seed}"
+  "mixed_agg_0.75|--method mixed --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.75 --seed ${seed}"
   "calibration|--method calibration --input-dir ${calib_dir} --seed ${seed}"
   "random|--method random --seed ${seed}"
 )

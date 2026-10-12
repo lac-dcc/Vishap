@@ -356,19 +356,36 @@ def _build_tensor_quant_overrides(
     input_stats: Stats,
     lambd: int,
     constant_onnx_names: set[str] | None = None,
+    calibrated_onnx_names: set[str] | None = None,
 ) -> dict[str, list[dict[str, np.float32]]]:
-    """Map Vishap distribution estimates to ORT TensorQuantOverrides keys."""
+    """Map Vishap distribution estimates to ORT TensorQuantOverrides keys.
+
+    ``calibrated_onnx_names`` is the set of ONNX nodes preloaded from ORT
+    calibration (mixed mode). Those nodes, and graph outputs they produce,
+    use measured min/max. Passing the set (including an empty one) also marks
+    the model input as measured. ``None`` is the Vishap-only path, which keeps
+    the lambda clip for every non-constant.
+    """
     # Map ONNX node names (from MLIR locs) to actual output tensor names.
     # TensorQuantOverrides keys must be tensor names, not node names / ":0" ports.
     node_name_to_outputs = {
         node.name: list(node.output) for node in onnx_model.graph.node if node.name
     }
+    output_to_producer = {
+        output_name: node.name
+        for node in onnx_model.graph.node
+        if node.name
+        for output_name in node.output
+    }
     constant_names = constant_onnx_names or set()
+    real_minmax_names = constant_names
+    if calibrated_onnx_names is not None:
+        real_minmax_names = constant_names | calibrated_onnx_names
 
     injected_stats: dict[str, list[dict[str, np.float32]]] = {}
     for node_name, out_stats in onnx_name_to_dists.items():
         outputs = node_name_to_outputs.get(node_name, [])
-        use_real_minmax = node_name in constant_names
+        use_real_minmax = node_name in real_minmax_names
         for idx, stats in enumerate(out_stats):
             if idx >= len(outputs):
                 logger.warning(
@@ -384,9 +401,16 @@ def _build_tensor_quant_overrides(
 
     input_name = onnx_model.graph.input[0].name
     output_names = [out.name for out in onnx_model.graph.output]
-    injected_stats[input_name] = _vishap_dist_to_tensor_quant(lambd, input_stats)
+    injected_stats[input_name] = _vishap_dist_to_tensor_quant(
+        lambd, input_stats, use_real_minmax=calibrated_onnx_names is not None
+    )
     for output_name, stats in zip(output_names, func_output_stats):
-        injected_stats[output_name] = _vishap_dist_to_tensor_quant(lambd, stats)
+        producer = output_to_producer.get(output_name)
+        injected_stats[output_name] = _vishap_dist_to_tensor_quant(
+            lambd,
+            stats,
+            use_real_minmax=producer is not None and producer in real_minmax_names,
+        )
 
     return injected_stats
 
@@ -422,15 +446,62 @@ def _float_activation_tensor_names(model: onnx.ModelProto) -> set[str]:
     return tensors
 
 
-def _collect_ort_tensor_stats(
-    onnx_model: onnx.ModelProto, batch: np.ndarray
-) -> dict[str, Stats]:
-    """Run one ORT inference exposing float activations and return their stats.
+def _input_stats_from_batches(batches: list[np.ndarray]) -> Stats:
+    """Stats over one batch, or concatenated batches along the batch axis."""
+    return get_array_stats(
+        batches[0] if len(batches) == 1 else np.concatenate(batches, axis=0)
+    )
 
-    We fetch raw intermediate tensors and computes full (min, max, mean,
+
+def _load_method_inputs(
+    input_model: str,
+    input_file: str | None,
+    input_dir: str | None,
+    num_inputs: int,
+    seed: int | None,
+    method_name: str,
+) -> list[np.ndarray] | None:
+    """Load up to ``num_inputs`` tensors for Vishap or mixed quantization."""
+    if input_file:
+        if num_inputs > 1:
+            logger.error("--num-inputs > 1 requires --input-dir, not --input-file")
+            return None
+        input_source = input_file
+    elif input_dir:
+        input_source = input_dir
+    else:
+        logger.error("%s quantization requires --input-file or --input-dir", method_name)
+        return None
+
+    batches = load_inputs_for_model(
+        input_model, input_source, max_images=num_inputs, seed=seed
+    )
+    if not batches:
+        logger.error(f"No inputs loaded from {input_source}")
+        return None
+    if len(batches) < num_inputs:
+        logger.warning(
+            "Requested %d input(s) but only loaded %d from %s",
+            num_inputs,
+            len(batches),
+            input_source,
+        )
+    return batches
+
+
+def _collect_ort_tensor_stats(
+    onnx_model: onnx.ModelProto, batches: list[np.ndarray]
+) -> dict[str, Stats]:
+    """Run ORT inference(s) exposing float activations and return merged stats.
+
+    We fetch raw intermediate tensors and compute full (min, max, mean,
     variance) tuples, as required by Vishap. Graph optimizations are disabled
-    so fusions do not remove observed tensors.
+    so fusions do not remove observed tensors. Multiple batches are merged as
+    if each activation were concatenated across inputs.
     """
+    if not batches:
+        return {}
+
     augmented = onnx.ModelProto()
     augmented.CopyFrom(onnx_model)
     graph = augmented.graph
@@ -467,11 +538,51 @@ def _collect_ort_tensor_stats(
     )
     input_name = session.get_inputs()[0].name
     output_names = [out.name for out in session.get_outputs()]
-    results = session.run(None, {input_name: batch})
-    return {
-        name: get_array_stats(np.asarray(arr).astype(np.float32))
-        for name, arr in zip(output_names, results)
-    }
+
+    if len(batches) == 1:
+        results = session.run(None, {input_name: batches[0]})
+        return {
+            name: get_array_stats(np.asarray(arr).astype(np.float32))
+            for name, arr in zip(output_names, results)
+        }
+
+    counts: dict[str, int] = {}
+    mins: dict[str, np.float64] = {}
+    maxs: dict[str, np.float64] = {}
+    sums: dict[str, np.float64] = {}
+    sumsqs: dict[str, np.float64] = {}
+    for batch in batches:
+        results = session.run(None, {input_name: batch})
+        for name, arr in zip(output_names, results):
+            a = np.asarray(arr).astype(np.float32)
+            mn, mx, mean, var = get_array_stats(a)
+            n = int(a.size)
+            s = mean * n
+            ss = (var + mean * mean) * n
+            if name not in counts:
+                counts[name] = n
+                mins[name] = mn
+                maxs[name] = mx
+                sums[name] = s
+                sumsqs[name] = ss
+            else:
+                counts[name] += n
+                mins[name] = min(mins[name], mn)
+                maxs[name] = max(maxs[name], mx)
+                sums[name] += s
+                sumsqs[name] += ss
+
+    merged: dict[str, Stats] = {}
+    for name, n in counts.items():
+        mean = sums[name] / n
+        var = sumsqs[name] / n - mean * mean
+        merged[name] = (
+            mins[name],
+            maxs[name],
+            np.float64(mean),
+            np.float64(max(var, 0.0)),
+        )
+    return merged
 
 
 def _tensors_data_from_overrides(
@@ -538,6 +649,7 @@ def _quantize_with_vishap_dists(
     annotated_module,
     input_stats: Stats,
     lambd: int,
+    calibrated_onnx_names: set[str] | None = None,
 ) -> list[tuple[str, float]]:
     t0 = time.perf_counter_ns()
     valid_onnx_names = set(_get_onnx_node_names(onnx_model))
@@ -552,6 +664,7 @@ def _quantize_with_vishap_dists(
         input_stats,
         lambd,
         constant_onnx_names,
+        calibrated_onnx_names,
     )
     t2 = time.perf_counter_ns()
     _quantize_from_overrides(input_model, output_model, injected_stats)
@@ -580,37 +693,16 @@ def _vishap_quantization(
         logger.error("Could not load ONNX model")
         return LogicalResult.FAILURE
 
-    if input_file:
-        if num_inputs > 1:
-            logger.error("--num-inputs > 1 requires --input-dir, not --input-file")
-            return LogicalResult.FAILURE
-        input_source = input_file
-    elif input_dir:
-        input_source = input_dir
-    else:
-        logger.error("Vishap quantization requires --input-file or --input-dir")
-        return LogicalResult.FAILURE
-
-    batches = load_inputs_for_model(
-        input_model, input_source, max_images=num_inputs, seed=seed
+    batches = _load_method_inputs(
+        input_model, input_file, input_dir, num_inputs, seed, "Vishap"
     )
-    if not batches:
-        logger.error(f"No inputs loaded from {input_source}")
+    if batches is None:
         return LogicalResult.FAILURE
-    if len(batches) < num_inputs:
-        logger.warning(
-            "Requested %d input(s) but only loaded %d from %s",
-            num_inputs,
-            len(batches),
-            input_source,
-        )
 
     logger.info(
         "Using stats from %d concatenated input(s) for Vishap analysis", len(batches)
     )
-    input_stats = get_array_stats(
-        batches[0] if len(batches) == 1 else np.concatenate(batches, axis=0)
-    )
+    input_stats = _input_stats_from_batches(batches)
 
     try:
         # We assume one input tensor per model
@@ -654,6 +746,7 @@ def _mixed_quantization(
     input_file: str | None = None,
     input_dir: str | None = None,
     lambd: int = 5,
+    num_inputs: int = 1,
     preload_ratio: float | None = None,
     vishap_op_type: str | None = None,
     seed: int | None = None,
@@ -668,25 +761,24 @@ def _mixed_quantization(
         logger.error("Could not load ONNX model")
         return LogicalResult.FAILURE
 
-    if input_file:
-        input_source = input_file
-    elif input_dir:
-        input_source = input_dir
-    else:
-        logger.error("Mixed quantization requires --input-file or --input-dir")
+    batches = _load_method_inputs(
+        input_model, input_file, input_dir, num_inputs, seed, "Mixed"
+    )
+    if batches is None:
         return LogicalResult.FAILURE
 
-    batches = load_inputs_for_model(input_model, input_source, max_images=1, seed=seed)
-    if not batches or batches[0] is None:
-        logger.error(f"No inputs loaded from {input_source}")
-        return LogicalResult.FAILURE
-
-    input_stats = get_array_stats(batches[0])
+    logger.info(
+        "Using stats from %d concatenated input(s) for mixed analysis", len(batches)
+    )
+    input_stats = _input_stats_from_batches(batches)
 
     try:
         t2 = time.perf_counter_ns()
-        logger.info("Running ORT inference to collect activation stats")
-        tensor_stats = _collect_ort_tensor_stats(onnx_model, batches[0])
+        logger.info(
+            "Running ORT inference to collect activation stats from %d input(s)",
+            len(batches),
+        )
+        tensor_stats = _collect_ort_tensor_stats(onnx_model, batches)
         node_name_to_outputs, node_name_to_op_type = _onnx_node_maps(onnx_model)
         mixed_module = parse_vishap_module(_module_bytecode(mlir_module))
         if vishap_op_type is not None:
@@ -707,7 +799,7 @@ def _mixed_quantization(
                     vishap_op_type,
                 )
                 return
-            n_preloaded = attach_tensor_stats_to_ops(
+            preloaded_names = attach_tensor_stats_to_ops(
                 mixed_module,
                 tensor_stats,
                 node_name_to_outputs,
@@ -715,11 +807,11 @@ def _mixed_quantization(
                 vishap_op_type=vishap_op_type,
             )
         else:
-            n_preloaded = attach_tensor_stats_to_ops(
+            preloaded_names = attach_tensor_stats_to_ops(
                 mixed_module, tensor_stats, node_name_to_outputs, preload_ratio, seed
             )
         t3 = time.perf_counter_ns()
-        logger.info("Preloaded ORT distributions on %d ops", n_preloaded)
+        logger.info("Preloaded ORT distributions on %d ops", len(preloaded_names))
 
         t4 = time.perf_counter_ns()
         annotate_distributions_on_module(mixed_module, [input_stats])
@@ -732,6 +824,7 @@ def _mixed_quantization(
             mixed_module,
             input_stats,
             lambd,
+            preloaded_names,
         )
     except ImportError:
         logger.error(
@@ -744,9 +837,16 @@ def _mixed_quantization(
         return LogicalResult.FAILURE
 
     if vishap_op_type is not None:
-        perf_method = f"mixed_op_{_sanitize_op_type_label(vishap_op_type)}"
+        op_label = _sanitize_op_type_label(vishap_op_type)
+        perf_method = (
+            f"mixed_agg_op_{op_label}" if num_inputs > 1 else f"mixed_op_{op_label}"
+        )
     else:
-        perf_method = f"mixed_{preload_ratio:.2f}"
+        perf_method = (
+            f"mixed_agg_{preload_ratio:.2f}"
+            if num_inputs > 1
+            else f"mixed_{preload_ratio:.2f}"
+        )
     _save_perf_stages(
         perf_out,
         Path(input_model).stem,
@@ -884,8 +984,8 @@ def _parse_args():
         type=int,
         default=1,
         help=(
-            "number of inputs to concatenate for Vishap distribution estimation "
-            "(default: %(default)s; requires --input-dir when > 1)"
+            "number of inputs to accumulate for Vishap or mixed distribution "
+            "estimation (default: %(default)s; requires --input-dir when > 1)"
         ),
     )
     parser.add_argument(
@@ -987,17 +1087,13 @@ def _main() -> LogicalResult:
             if args.preload_ratio is not None and not 0.0 <= args.preload_ratio <= 1.0:
                 logger.error("--preload-ratio must be in [0, 1]")
                 return LogicalResult.FAILURE
-            if args.num_inputs > 1:
-                logger.error(
-                    "Mixed quantization uses a single input; do not set --num-inputs > 1"
-                )
-                return LogicalResult.FAILURE
             return _mixed_quantization(
                 args.input_model,
                 args.output_model,
                 args.input_file,
                 args.input_dir,
                 args.lambd,
+                args.num_inputs,
                 args.preload_ratio,
                 args.vishap_op_type,
                 args.seed,
