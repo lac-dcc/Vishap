@@ -4,3 +4,8 @@
 [submodule "external/stablehlo"]
 	path = external/stablehlo
 	url = https://github.com/openxla/stablehlo
+	ignore = dirty
+[submodule "external/torch-mlir"]
+	path = external/torch-mlir
+	url = https://github.com/llvm/torch-mlir.git
+	ignore = dirty

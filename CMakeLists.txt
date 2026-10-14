@@ -53,11 +53,16 @@ add_compile_options(-Wall)
 # Subdirectories
 # ------------------------------------------------------------------------------
 
+# mlir-probe for the probe dialect and utilities.
 add_subdirectory(external/mlir-probe)
 
+# stablehlo for the stablehlo dialect
 set(STABLEHLO_BUILD_EMBEDDED ON CACHE BOOL "" FORCE)
 set(STABLEHLO_ENABLE_BINDINGS_PYTHON OFF CACHE BOOL "" FORCE)
 add_subdirectory(external/stablehlo)
+
+# Build instructions for torch-mlir utilties (e.g., ONNX importer).
+include(build_tools/cmake/TorchMLIR.cmake)
 
 add_subdirectory(lib)
 add_subdirectory(tools)

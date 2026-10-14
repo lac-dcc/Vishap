@@ -20,6 +20,9 @@ target_link_libraries(vishap-opt
   StablehloOptimizationPasses
   StablehloLinalgTransforms
 
+  # Torch dialect and ONNX/StableHLO lowering pipelines.
+  TorchMLIRInitAll
+
   # MLIR dependencies
   MLIRMlirOptMain
   ${dialect_libs}
