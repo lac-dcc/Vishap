@@ -1,8 +1,7 @@
 """Convert ONNX model into an MLIR file, using mainly upstream dialects.
 
-This script uses torch-mlir to convert ONNX models into MLIR files. We avoid
-using non-upstream dialects (e.g., `torch`), since the main goal is to use
-these models in projects that.
+This script uses Vishap's embedded ONNX importer, which comes from torch-mlir.
+The importer produces the torch dialect, which is then lowered to StableHLO.
 
 This script can be called directly via command line, but you can also use it
 as a module to import the `convert_onnx_to_mlir` function.
@@ -31,22 +30,21 @@ import logging
 import onnx
 import sys
 
-from torch_mlir import ir
-from torch_mlir.extras import onnx_importer
-from torch_mlir.dialects import torch as torch_d
-from torch_mlir.compiler_utils import run_pipeline_with_repro_report
-
-from utils import ensure_mlir_bindings_on_path
+from utils import (
+    ensure_vishap_bindings_on_path,
+    make_vishap_context,
+    run_vishap_pipeline,
+)
 
 logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 try:
-    ensure_mlir_bindings_on_path()
-    from mlir.ir import Module
-except:
+    ensure_vishap_bindings_on_path()
+    from vishap.extras import onnx_importer
+except Exception:
     logger.error(
-        "MLIR bindings are not available. Ensure you have an LLVM with MLIR_ENABLE_BINDINGS_PYTHON."
+        "Vishap bindings are not available. Build Vishap with MLIR_ENABLE_BINDINGS_PYTHON."
     )
     exit(1)
 
@@ -131,7 +129,7 @@ def convert_onnx_to_mlir(
         elide_constant_if_larger: Elide constants in emitted IR if larger than specified value.
 
     Raises:
-        May re-raise exceptions from torch-mlir and onnx utilities
+        May re-raise exceptions from the ONNX importer and onnx utilities
 
     Returns:
         The imported MLIR module.
@@ -142,9 +140,7 @@ def convert_onnx_to_mlir(
     else:
         inferred_model = model
 
-    with ir.Context() as ctx:
-        torch_d.register_dialect(ctx)
-
+    with make_vishap_context() as ctx:
         model_info = onnx_importer.ModelInfo(inferred_model)
         module = model_info.create_module(context=ctx)
         module_op = module.operation
@@ -162,9 +158,9 @@ def convert_onnx_to_mlir(
             imp.import_all()
             module_op.verify()
             pipeline = ",".join(passes)
-            # Same as `torch-mlir-opt -pass-pipeline=<pipeline> <filename>`
-            run_pipeline_with_repro_report(
-                module_op,
+            # Same as `vishap-opt -pass-pipeline=<pipeline> <filename>`
+            run_vishap_pipeline(
+                module,
                 f"builtin.module({pipeline})",
                 "Lowering Torch ONNX -> StableHLO Backend IR",
             )

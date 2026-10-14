@@ -6,6 +6,9 @@
 #include "stablehlo/integrations/c/StablehloPasses.h"
 #include "stablehlo/integrations/c/VhloDialect.h"
 
+#include "torch-mlir-c/Dialects.h"
+#include "torch-mlir-c/Registration.h"
+
 #include "mlir/Bindings/Python/Nanobind.h"
 #include "mlir/Bindings/Python/NanobindAdaptors.h"
 
@@ -18,6 +21,7 @@ NB_MODULE(_vishap, m) {
   // pass pipelines can be parsed by name from Python.
   vishapRegisterAllPasses();
   mlirRegisterAllStablehloPasses();
+  torchMlirRegisterAllPasses();
 
   m.def(
       "register_dialects",
@@ -27,6 +31,7 @@ NB_MODULE(_vishap, m) {
             mlirGetDialectHandle__chlo__(),
             mlirGetDialectHandle__vhlo__(),
             mlirGetDialectHandle__probe__(),
+            mlirGetDialectHandle__torch__(),
         };
         for (MlirDialectHandle handle : handles) {
           mlirDialectHandleRegisterDialect(handle, context);
@@ -35,6 +40,6 @@ NB_MODULE(_vishap, m) {
         }
       },
       nb::arg("context"), nb::arg("load") = true,
-      "Register (and optionally load) the StableHLO, CHLO, VHLO, and Probe "
-      "dialects in the given context.");
+      "Register (and optionally load) the StableHLO, CHLO, VHLO, Probe, and "
+      "Torch dialects in the given context.");
 }

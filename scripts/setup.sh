@@ -3,6 +3,9 @@
 set -e
 source "$(dirname "${BASH_SOURCE[0]}")/env_check.sh"
 
+root_dir="$(pwd -P)"
+ln -sfn "${root_dir}/external/stablehlo" "${root_dir}/external/torch-mlir/externals/stablehlo"
+
 mkdir -p build
 build_dir="$(cd ./build && pwd -P)"
 

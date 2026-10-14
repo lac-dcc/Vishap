@@ -10,6 +10,15 @@ add_compile_definitions("MLIR_PYTHON_PACKAGE_PREFIX=${MLIR_PYTHON_PACKAGE_PREFIX
 
 declare_mlir_python_sources(VishapPythonSources)
 
+# onnx_importer.py is written to be relocated. Its relative imports
+# (``..ir``, ``..dialects.func``) resolve against the vishap package.
+declare_mlir_python_sources(VishapPythonSources.Importers
+  ROOT_DIR "${CMAKE_SOURCE_DIR}/external/torch-mlir/python/torch_mlir"
+  ADD_TO_PARENT VishapPythonSources
+  SOURCES
+    extras/onnx_importer.py
+)
+
 declare_mlir_python_extension(VishapPythonSources.NanobindExtension
   MODULE_NAME _vishap
   ADD_TO_PARENT VishapPythonSources
@@ -24,6 +33,7 @@ declare_mlir_python_extension(VishapPythonSources.NanobindExtension
     StablehloCAPI
     ChloCAPI
     VhloCAPI
+    TorchMLIRCAPI
 )
 
 ################################################################################
