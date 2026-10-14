@@ -30,7 +30,11 @@ import logging
 import onnx
 import sys
 
-from utils import ensure_vishap_bindings_on_path, make_vishap_context, run_vishap_pipeline
+from utils import (
+    ensure_vishap_bindings_on_path,
+    make_vishap_context,
+    run_vishap_pipeline,
+)
 
 logging.basicConfig(format="%(levelname)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
