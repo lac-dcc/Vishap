@@ -9,6 +9,13 @@ extern "C" PROBE_EXPORT void
 _mlir_ciface_probeObserveMemrefF32(UnrankedMemRefType<float> *m, int32_t opID,
                                    int32_t resultID);
 
-extern "C" PROBE_EXPORT void _mlir_ciface_probeReport();
+extern "C" PROBE_EXPORT void
+_mlir_ciface_probeObserveMemrefF64(UnrankedMemRefType<double> *m, int32_t opID,
+                                   int32_t resultID);
+
+/// Write the probe report to the file whose path is given by the
+/// null-terminated string \p pathMemref.
+extern "C" PROBE_EXPORT void
+_mlir_ciface_probeReport(const char *reportPath);
 
 #endif // VISHAP_INCLUDE_RUNTIME_PROBE_H
