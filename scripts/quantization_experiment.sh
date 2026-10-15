@@ -22,6 +22,7 @@ Required arguments:
 
 Optional arguments:
   -l, --lambda <int>          Lambda parameter for the quantization script (default: 5).
+  -p, --percentile <float>    Percentile of per-slice min/max for the percentile range mode (default: 50).
   -s, --seed   <int>          RNG seed for quantization (default: 42)
   -h, --help                  Display this help message
 EOF
@@ -34,6 +35,7 @@ echo_cmd() {
 }
 
 lambda=5
+percentile=50
 seed=42
 
 # Parse arguments
@@ -45,6 +47,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -l|--lambda)
       lambda="$2"
+      shift 2
+      ;;
+    -p|--percentile)
+      percentile="$2"
       shift 2
       ;;
     -s|--seed)
@@ -69,6 +75,11 @@ fi
 
 if [[ ! -d "$input_dir" ]]; then
   echo "Error: ONNX models directory does not exist: $input_dir" >&2
+  exit 1
+fi
+
+if ! awk -v p="$percentile" 'BEGIN { exit !(p >= 0 && p <= 100) }'; then
+  echo "Error: --percentile must be in [0, 100]" >&2
   exit 1
 fi
 
@@ -103,14 +114,15 @@ quantize_script="$root_dir/scripts/ort_quantize.py"
 # Each entry: label|extra ort_quantize.py args (after model path)
 # label is used for output filenames, compare --type, and section banners.
 quant_methods=(
-  "vishap|--method vishap --input-file ${input_image} --seed ${seed}"
-  "vishap_agg|--method vishap --input-dir ${calib_dir} --num-inputs ${num_images} --seed ${seed}"
-  "mixed_0.25|--method mixed --input-file ${input_image} --preload-ratio 0.25 --seed ${seed}"
-  "mixed_0.50|--method mixed --input-file ${input_image} --preload-ratio 0.5 --seed ${seed}"
-  "mixed_0.75|--method mixed --input-file ${input_image} --preload-ratio 0.75 --seed ${seed}"
-  "mixed_agg_0.25|--method mixed --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.25 --seed ${seed}"
-  "mixed_agg_0.50|--method mixed --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.5 --seed ${seed}"
-  "mixed_agg_0.75|--method mixed --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.75 --seed ${seed}"
+  "vishap|--method vishap --lambda $lambda --input-file ${input_image} --seed ${seed}"
+  "vishap_agg|--method vishap --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --seed ${seed}"
+  "vishap_p${percentile}|--method vishap --input-dir ${calib_dir} --num-inputs ${num_images} --seed ${seed} --range-mode percentile --range-percentile ${percentile}"
+  "mixed_0.25|--method mixed --lambda $lambda --input-file ${input_image} --preload-ratio 0.25 --seed ${seed}"
+  "mixed_0.50|--method mixed --lambda $lambda --input-file ${input_image} --preload-ratio 0.5 --seed ${seed}"
+  "mixed_0.75|--method mixed --lambda $lambda --input-file ${input_image} --preload-ratio 0.75 --seed ${seed}"
+  "mixed_agg_0.25|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.25 --seed ${seed}"
+  "mixed_agg_0.50|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.5 --seed ${seed}"
+  "mixed_agg_0.75|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.75 --seed ${seed}"
   "calibration|--method calibration --input-dir ${calib_dir} --seed ${seed}"
   "random|--method random --seed ${seed}"
 )
@@ -128,7 +140,7 @@ for method_spec in "${quant_methods[@]}"; do
       echo "*************************$onnx_file*************************"
       filename=$(basename "${onnx_file%.*}")
       out_file="$out_dir/${filename}_${label}.onnx"
-      echo_cmd python $quantize_script "$onnx_file" --output-model "$out_file" $quant_args --perf-out "perf_info_${date_string}_lambda{$lambda}.csv" --lambda $lambda
+      echo_cmd python $quantize_script "$onnx_file" --output-model "$out_file" $quant_args --perf-out "perf_info_${date_string}_lambda{$lambda}_p{$percentile}.csv"
     fi
   done
 done
@@ -146,7 +158,7 @@ for onnx_file in "$input_dir"/*.onnx; do
     for method_spec in "${quant_methods[@]}"; do
       IFS='|' read -r label _ <<< "$method_spec"
       quant_file="$out_dir/${filename}_${label}.onnx"
-      echo_cmd python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "quant_results_${date_string}_lambda{$lambda}.csv" --lambda $lambda
+      echo_cmd python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "quant_results_${date_string}_lambda{$lambda}_p{$percentile}.csv"
     done
     echo
   fi
