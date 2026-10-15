@@ -1,5 +1,10 @@
 // RUN: vishap-opt --add-probe-calls %s | FileCheck %s --check-prefixes=CHECK,DIST-ONLY
 // RUN: vishap-opt --add-probe-calls="all-float-ops" %s | FileCheck %s --check-prefixes=CHECK,ALL-OPS
+// RUN: vishap-opt --add-probe-calls="all-float-ops report-file=my_report.csv" %s | FileCheck %s --check-prefix=REPORT-FILE
+
+// The report file path is forwarded to the runtime via the reportArgs
+// attribute of probe.report.
+// REPORT-FILE: probe.report() {reportArgs = ["my_report.csv"]}
 
 func.func @no_dist_info(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>, %arg2: tensor<2x2xf32>) -> tensor<2x2xf32> {
   %0 = stablehlo.add %arg0, %arg1 : tensor<2x2xf32>
@@ -11,7 +16,7 @@ func.func @no_dist_info(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>, %arg2: t
 // ALL-OPS-NEXT:  probe.observe(%[[ADD_RES]] : tensor<2x2xf32>) {opID = 0 : i32, resultID = 0 : i32}
 // CHECK-NEXT:    %[[DOT_RES:.*]] = stablehlo.dot_general
 // ALL-OPS-NEXT:  probe.observe(%[[DOT_RES]] : tensor<2x2xf32>) {opID = 1 : i32, resultID = 0 : i32}
-// ALL-OPS-NEXT:  probe.report
+// ALL-OPS-NEXT:  probe.report() {reportArgs = ["vishap_probe_report.csv"]}
 // CHECK-NEXT:    return
 
 func.func @with_dist_info(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>, %arg2: tensor<2x2xf32>) -> tensor<2x2xf32> {

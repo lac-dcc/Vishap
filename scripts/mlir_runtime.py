@@ -1,6 +1,8 @@
 import csv
 import ctypes
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +14,7 @@ from utils import (
     ensure_vishap_bindings_on_path,
     get_array_stats,
     get_llvm_build_dir,
+    load_input_array,
     parse_onnx_loc_name,
     run_vishap_pipeline,
 )
@@ -126,28 +129,52 @@ def _ranked_tensor_spec(ty) -> tuple[tuple[int, ...], np.dtype]:
     return tuple(ty.shape), _mlir_element_type_to_dtype(ty.element_type)
 
 
-def io_arrays_from_entry_func(
-    module, provided_inputs: list[np.ndarray] | None = None
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Allocate numpy I/O arrays from the entry function type.
+def _entry_func(module):
+    """Return the entry `func.func` in the MLIR module. The first operation in the module is assumed to be it."""
+    return module.body.operations[0]
 
-    ``provided_inputs[i]`` is used for argument i when present; remaining
-    inputs and all outputs are zeros.
+
+def _entry_function_name(module) -> str:
+    """Symbol name of the entry `func.func` in the MLIR module."""
+    return _entry_func(module).attributes["sym_name"].value
+
+
+def io_arrays_from_entry_func(
+    module,
+    provided_inputs: list[np.ndarray] | None = None,
+    *,
+    input_file: Path | str | None = None,
+    input_initializer: Callable[[tuple[int, ...], np.dtype], np.ndarray] | None = None,
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Allocate numpy I/O arrays from an entry function's ranked tensor types.
+
+    Argument ``i`` is taken from ``provided_inputs[i]`` when that entry exists.
+    ``input_file`` is loaded (and resized, for images) into argument 0 using
+    the inferred shape; it cannot be combined with ``provided_inputs[0]``.
+    Every other argument is ``input_initializer(shape, dtype)`` when that
+    callback is set, and zeros otherwise. Outputs are always zeros.
+
+    Shapes are read from the first operation in the module.
     """
-    func = module.body.operations[0]
-    func_type = func.type
+    func_type = _entry_func(module).type
     provided = provided_inputs or []
+    if input_file is not None and provided:
+        raise ValueError("input_file and provided_inputs both set argument 0")
 
     input_arrays: list[np.ndarray] = []
     for i, ty in enumerate(func_type.inputs):
         shape, dtype = _ranked_tensor_spec(ty)
-        if i < len(provided):
+        if input_file is not None and i == 0:
+            input_arrays.append(load_input_array(input_file, shape, dtype))
+        elif i < len(provided):
             arr = np.asarray(provided[i])
             if tuple(arr.shape) != shape:
                 raise ValueError(
                     f"Function argument {i} has shape {shape}, got {arr.shape}"
                 )
             input_arrays.append(arr.astype(dtype, copy=False))
+        elif input_initializer is not None:
+            input_arrays.append(input_initializer(shape, dtype))
         else:
             input_arrays.append(np.zeros(shape, dtype=dtype))
 
@@ -310,9 +337,7 @@ def attach_tensor_stats_to_ops(
         outputs = node_name_to_outputs[onnx_name]
         if any(name not in tensor_stats for name in outputs):
             continue
-        candidates.append(
-            (op, [tensor_stats[name] for name in outputs], onnx_name)
-        )
+        candidates.append((op, [tensor_stats[name] for name in outputs], onnx_name))
 
     if vishap_op_type is not None:
         chosen = {
@@ -358,24 +383,78 @@ def attach_tensor_stats_to_ops(
 
 
 def parse_probe_report(path: Path | str = PROBE_REPORT_PATH) -> list[Stats]:
-    """Read probe CSV rows as (min, max, mean, variance) tuples."""
-    dists: list[Stats] = []
+    """Read tensor-level probe CSV rows as (min, max, mean, variance) tuples.
+
+    Per-slice rows (axis != -1) are skipped, so the result has one entry per
+    observation, in observation order.
+    """
+    return [obs.summary for obs in parse_probe_report_observations(path)]
+
+
+@dataclass
+class ProbeObservation:
+    """One probe observation: tensor-level summary plus per-slice stats.
+
+    ``axes[axis]`` holds one ``Stats`` per index of that axis. Axes of size
+    <= 1 have no entry (the runtime does not emit slice rows for them).
+    """
+
+    op_id: int
+    result_id: int
+    summary: Stats
+    axes: dict[int, list[Stats]]
+
+
+def parse_probe_report_observations(
+    path: Path | str = PROBE_REPORT_PATH,
+) -> list[ProbeObservation]:
+    """Read the probe CSV, grouping per-slice rows under their observation.
+
+    The report interleaves, per observation, one tensor-level row
+    (``axis == sliceIndex == -1``) followed by its per-slice rows.
+    """
+    observations: list[ProbeObservation] = []
     with open(path, "r", encoding="utf-8") as csvfile:
         reader = csv.reader(csvfile, delimiter=",")
         next(reader)
         for row in reader:
-            dists.append(tuple(np.float64(val) for val in row[2:]))
-    return dists
+            op_id, result_id, axis, slice_idx = (int(val) for val in row[:4])
+            stats = tuple(np.float64(val) for val in row[4:])
+            if axis == -1:
+                observations.append(ProbeObservation(op_id, result_id, stats, {}))
+                continue
+            if not observations:
+                raise ValueError(f"Per-slice row before any tensor-level row: {row}")
+            obs = observations[-1]
+            if (op_id, result_id) != (obs.op_id, obs.result_id):
+                raise ValueError(
+                    f"Per-slice row {row} does not match current observation "
+                    f"(opID={obs.op_id}, resultID={obs.result_id})"
+                )
+            slices = obs.axes.setdefault(axis, [])
+            if slice_idx != len(slices):
+                raise ValueError(f"Out-of-order slice row: {row}")
+            slices.append(stats)
+    return observations
 
 
-def lower_module_to_llvm(module, all_float_ops: bool = False):
+def lower_module_to_llvm(
+    module, all_float_ops: bool = False, report_file: Path | str | None = None
+):
     """Lower a StableHLO module to LLVM, inserting probe calls.
 
-    Mutates ``module`` in place.
+    ``report_file`` is the path the probe runtime writes its CSV report to
+    (default: ``vishap_probe_report.csv`` in the working directory). Mutates
+    ``module`` in place.
     """
-    probe_pass = (
-        "add-probe-calls{all-float-ops}" if all_float_ops else "add-probe-calls"
-    )
+    probe_options = []
+    if all_float_ops:
+        probe_options.append("all-float-ops")
+    if report_file is not None:
+        probe_options.append(f"report-file={report_file}")
+    probe_pass = "add-probe-calls"
+    if probe_options:
+        probe_pass += "{" + " ".join(probe_options) + "}"
     pipeline = f"""builtin.module(
         func.func(
             {probe_pass},
@@ -383,11 +462,28 @@ def lower_module_to_llvm(module, all_float_ops: bool = False):
             cse
         ),
         stablehlo-convert-to-signless,
-        func.func(stablehlo-legalize-to-linalg),
+        func.func(
+            stablehlo-legalize-to-linalg,
+            linalg-generalize-named-ops,
+            linalg-fuse-elementwise-ops,
+            linalg-fold-unit-extent-dims,
+            canonicalize,
+            cse
+        ),
         empty-tensor-to-alloc-tensor,
         one-shot-bufferize{{bufferize-function-boundaries}},
+        func.func(
+            buffer-hoisting,
+            buffer-loop-hoisting,
+            promote-buffers-to-stack
+        ),
         probe-lower-to-func-calls,
         convert-linalg-to-loops,
+        func.func(
+            canonicalize,
+            cse,
+            fold-memref-alias-ops
+        ),
         convert-scf-to-cf,
         expand-strided-metadata,
         lower-affine,
@@ -422,13 +518,15 @@ def run_probed_network(
     module,
     input_arrays: list[np.ndarray],
     output_arrays: list[np.ndarray],
-    function: str,
     all_float_ops: bool = False,
+    report_file: Path | str | None = None,
 ) -> list[Stats]:
     """Lower ``module`` to LLVM, run it, and return output tensor stats.
 
-    Mutates ``module``. Writes ``vishap_probe_report.csv`` via the runtime.
+    Mutates ``module``. The runtime writes its CSV report to ``report_file``
+    (default: ``vishap_probe_report.csv`` in the working directory).
     """
+    function = _entry_function_name(module)
     llvm_build_dir = get_llvm_build_dir()
     mlir_shared_libs = [
         str(llvm_build_dir / "lib/libmlir_runner_utils.so"),
@@ -437,7 +535,9 @@ def run_probed_network(
     ]
 
     with module.context:
-        llvm_module = lower_module_to_llvm(module, all_float_ops=all_float_ops)
+        llvm_module = lower_module_to_llvm(
+            module, all_float_ops=all_float_ops, report_file=report_file
+        )
         engine = ExecutionEngine(llvm_module, opt_level=3, shared_libs=mlir_shared_libs)
 
     input_ptrs = [_array_to_ranked_memref_ptr(arr) for arr in input_arrays]

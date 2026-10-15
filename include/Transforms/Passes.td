@@ -50,6 +50,15 @@ def AddProbeCallsPass
       "Add probe calls for all operations with floating-point ranked-tensor "
       "results, not only those with vishap.distribution. Constant ops and ops "
       "nested in regions are skipped."
+    >,
+    Option<
+      "reportFile",
+      "report-file",
+      "std::string",
+      /*default=*/"\"vishap_probe_report.csv\"",
+      "Path of the CSV report file written by the probe runtime. Forwarded "
+      "to the runtime report function via the reportArgs attribute of "
+      "probe.report."
     >
   ];
 }

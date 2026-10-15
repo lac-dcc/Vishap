@@ -305,15 +305,16 @@ TensorDistribution computeConstantTensorDistribution(R range,
                                                      RankedTensorType type,
                                                      bool perAxis,
                                                      bool isSplat) {
-  Distribution summary = computeFloatRangeDistribution<FloatT, R>(range);
-  TensorDistribution result = TensorDistribution::uniform(summary, type);
   if (!perAxis || isSplat || !type.hasStaticShape()) {
-    return result;
+    Distribution summary = computeFloatRangeDistribution<FloatT, R>(range);
+    return TensorDistribution::uniform(summary, type);
   }
 
   std::vector<int64_t> shape(type.getShape().begin(), type.getShape().end());
-  auto perAxisDists = computePerAxisDistributions<FloatT, R>(range, shape);
-  for (auto [axis, slices] : llvm::enumerate(perAxisDists)) {
+  auto dists =
+      computeFloatRangeAndPerAxisDistributions<FloatT, R>(range, shape);
+  TensorDistribution result = TensorDistribution::uniform(dists.summary, type);
+  for (auto [axis, slices] : llvm::enumerate(dists.axes)) {
     result.axes[axis].slices.assign(slices.begin(), slices.end());
   }
   return result;
