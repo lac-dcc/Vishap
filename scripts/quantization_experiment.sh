@@ -21,12 +21,19 @@ Required arguments:
   -d, --input-dir <dir>       Directory containing input ONNX files
 
 Optional arguments:
-  -s, --seed <int>            RNG seed for quantization (default: 42)
+  -l, --lambda <int>          Lambda parameter for the quantization script (default: 5).
+  -s, --seed   <int>          RNG seed for quantization (default: 42)
   -h, --help                  Display this help message
 EOF
   exit "${1:-0}"
 }
 
+echo_cmd() {
+  echo "$@"
+  "$@"
+}
+
+lambda=5
 seed=42
 
 # Parse arguments
@@ -34,6 +41,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -d|--input-dir)
       input_dir="$2"
+      shift 2
+      ;;
+    -l|--lambda)
+      lambda="$2"
       shift 2
       ;;
     -s|--seed)
@@ -117,9 +128,7 @@ for method_spec in "${quant_methods[@]}"; do
       echo "*************************$onnx_file*************************"
       filename=$(basename "${onnx_file%.*}")
       out_file="$out_dir/${filename}_${label}.onnx"
-      echo python $quantize_script "$onnx_file" --output-model "$out_file" $quant_args --perf-out "perf_info_${date_string}.csv"
-      python $quantize_script "$onnx_file" --output-model "$out_file" $quant_args --perf-out "perf_info_${date_string}.csv"
-      echo
+      echo_cmd python $quantize_script "$onnx_file" --output-model "$out_file" $quant_args --perf-out "perf_info_${date_string}_lambda{$lambda}.csv" --lambda $lambda
     fi
   done
 done
@@ -137,8 +146,7 @@ for onnx_file in "$input_dir"/*.onnx; do
     for method_spec in "${quant_methods[@]}"; do
       IFS='|' read -r label _ <<< "$method_spec"
       quant_file="$out_dir/${filename}_${label}.onnx"
-      echo python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "quant_results_${date_string}.csv"
-      python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "quant_results_${date_string}.csv"
+      echo_cmd python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "quant_results_${date_string}_lambda{$lambda}.csv"
     done
     echo
   fi
