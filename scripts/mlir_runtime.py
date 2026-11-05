@@ -27,11 +27,13 @@ try:
     from vishap.execution_engine import ExecutionEngine
     from vishap.ir import (
         ArrayAttr,
+        BlockArgument,
         F64Type,
         FloatAttr,
         FloatType,
         IntegerType,
         Location,
+        Operation,
         RankedTensorType,
         UnitAttr,
         WalkOrder,
@@ -288,6 +290,99 @@ def collect_mixed_float_ops(module, node_name_to_outputs: dict[str, list[str]]) 
     return candidates_by_name
 
 
+def _defining_operation(value):
+    """Operation that produces `value`, or None for a block argument."""
+    if isinstance(value, BlockArgument):
+        return None
+    owner = value.owner
+    if isinstance(owner, Operation):
+        return owner
+    operation = getattr(owner, "operation", None)
+    if isinstance(operation, Operation):
+        return operation
+    return None
+
+
+def _candidate_producers(op, op_to_name: dict) -> list[str]:
+    """Candidate ONNX names that feed `op`, skipping non-candidates.
+
+    Block arguments, constants, and ops that are not mixed-float candidates
+    add no hop. Re-entering an op on the active walk is a cycle.
+    """
+    found: list[str] = []
+    seen_names: set[str] = set()
+    seen_ops: set = set()
+    path: set = set()
+
+    def walk(current) -> None:
+        if current in path:
+            raise ValueError(f"Cycle in mixed-candidate graph at {current.name}")
+        path.add(current)
+        try:
+            for value in current.operands:
+                defining = _defining_operation(value)
+                if defining is None or defining.name in CONSTANT_OP_NAMES:
+                    continue
+                if defining in path:
+                    raise ValueError(
+                        f"Cycle in mixed-candidate graph at {defining.name}"
+                    )
+                producer = op_to_name.get(defining)
+                if producer is not None:
+                    if producer not in seen_names:
+                        seen_names.add(producer)
+                        found.append(producer)
+                    continue
+                if defining in seen_ops:
+                    continue
+                seen_ops.add(defining)
+                walk(defining)
+        finally:
+            path.remove(current)
+
+    walk(op)
+    return found
+
+
+def _reject_predecessor_cycle(predecessors: dict[str, list[str]]) -> None:
+    """Raise if the candidate producer graph contains a cycle."""
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(name: str) -> None:
+        if name in visited:
+            return
+        if name in visiting:
+            raise ValueError(f"Cycle in mixed-candidate graph at {name}")
+        visiting.add(name)
+        for producer in predecessors.get(name, []):
+            if producer in predecessors:
+                visit(producer)
+        visiting.remove(name)
+        visited.add(name)
+
+    for name in predecessors:
+        visit(name)
+
+
+def mixed_candidate_predecessors(
+    module, node_name_to_outputs: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Map each mixed-float candidate to the candidates that produce its inputs.
+
+    Function arguments, constants, and non-candidate ops are transparent, so a
+    candidate fed only by those has an empty producer list. Raises ValueError
+    if the use-def chain or the candidate graph contains a cycle.
+    """
+    candidates = collect_mixed_float_ops(module, node_name_to_outputs)
+    op_to_name = {op: name for name, op in candidates.items()}
+    predecessors = {
+        name: _candidate_producers(op, op_to_name) for name, op in candidates.items()
+    }
+    _reject_predecessor_cycle(predecessors)
+    return predecessors
+
+
 def mixed_candidate_op_types(
     module,
     node_name_to_outputs: dict[str, list[str]],
@@ -306,79 +401,36 @@ def attach_tensor_stats_to_ops(
     module,
     tensor_stats: dict[str, Stats],
     node_name_to_outputs: dict[str, list[str]],
-    ratio: float | None = None,
-    seed: int | None = None,
-    *,
-    node_name_to_op_type: dict[str, str] | None = None,
-    vishap_op_type: str | None = None,
+    only_names: set[str],
 ) -> set[str]:
-    """Preload ONNX tensor stats onto a subset of matching MLIR ops.
+    """Preload ONNX tensor stats onto the requested mixed float ops.
 
-    Selection is either a random ``ratio`` of candidates, or every candidate
-    whose ONNX op type is not ``vishap_op_type`` (those ops are left for
-    Vishap static analysis). Exactly one of ``ratio`` or ``vishap_op_type``
-    must be set.
-
-    An op is a candidate when it is a mixed float op (see
+    ``only_names`` is the ONNX node names already chosen by the caller (the
+    preload ratio is applied there, so this function does not draw again).
+    An op is attached when it is a mixed float op (see
     ``collect_mixed_float_ops``) and every output tensor has an entry in
-    ``tensor_stats``. Returns the ONNX node names that received
-    ``vishap.distribution``.
+    ``tensor_stats``. Names with no such op are skipped. Returns the ONNX
+    node names that received ``vishap.distribution``.
     """
-    if (ratio is None) == (vishap_op_type is None):
-        raise ValueError("exactly one of ratio or vishap_op_type must be set")
-    if ratio is not None and not 0.0 <= ratio <= 1.0:
-        raise ValueError(f"preload ratio must be in [0, 1], got {ratio}")
-    if vishap_op_type is not None and node_name_to_op_type is None:
-        raise ValueError("node_name_to_op_type is required when vishap_op_type is set")
-
     mixed_ops = collect_mixed_float_ops(module, node_name_to_outputs)
-    candidates: list[tuple] = []
-    for onnx_name, op in mixed_ops.items():
-        outputs = node_name_to_outputs[onnx_name]
-        if any(name not in tensor_stats for name in outputs):
-            continue
-        candidates.append((op, [tensor_stats[name] for name in outputs], onnx_name))
-
-    if vishap_op_type is not None:
-        chosen = {
-            i
-            for i, (_, _, name) in enumerate(candidates)
-            if node_name_to_op_type.get(name) != vishap_op_type
-        }
-        n = len(chosen)
-        logger.info(
-            "Preloading tensor stats onto %d/%d candidate ops "
-            "(vishap-op-type=%s, %d left for Vishap)",
-            n,
-            len(candidates),
-            vishap_op_type,
-            len(candidates) - n,
-        )
-    else:
-        n = min(len(candidates), max(0, int(round(ratio * len(candidates)))))
-        logger.info(
-            "Preloading tensor stats onto %d/%d candidate ops (ratio=%s)",
-            n,
-            len(candidates),
-            ratio,
-        )
-        if n == 0:
-            return set()
-        rng = np.random.default_rng(seed)
-        chosen = {int(i) for i in rng.choice(len(candidates), size=n, replace=False)}
-
-    if n == 0:
-        return set()
-
     preloaded: set[str] = set()
     with module.context, Location.unknown():
-        for i, (op, dists, onnx_name) in enumerate(candidates):
-            if i not in chosen:
+        for onnx_name in only_names:
+            op = mixed_ops.get(onnx_name)
+            if op is None:
+                continue
+            outputs = node_name_to_outputs.get(onnx_name, [])
+            if not outputs or any(name not in tensor_stats for name in outputs):
                 continue
             op.attributes[VISHAP_DIST_ATTR] = stats_list_to_dist_attr(
-                dists, module.context
+                [tensor_stats[name] for name in outputs], module.context
             )
             preloaded.add(onnx_name)
+    logger.info(
+        "Attached measured distributions to %d/%d requested ops",
+        len(preloaded),
+        len(only_names),
+    )
     return preloaded
 
 

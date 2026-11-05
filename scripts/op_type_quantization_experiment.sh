@@ -22,6 +22,7 @@ Required arguments:
 
 Optional arguments:
   -s, --seed <int>            RNG seed for quantization (default: 42)
+  -l, --lambda <int>          Lambda parameter for the quantization script (default: 5).
   -h, --help                  Display this help message
 
 For each model, discovers mixed float ONNX op types and quantizes once per
@@ -31,6 +32,7 @@ EOF
   exit "${1:-0}"
 }
 
+lambda=5
 seed=42
 
 # Parse arguments
@@ -42,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -s|--seed)
       seed="$2"
+      shift 2
+      ;;
+    -l|--lambda)
+      lambda="$2"
       shift 2
       ;;
     -h|--help)
@@ -90,6 +96,7 @@ echo "Using validation set for compare: $val_dir"
 
 quantize_script="$root_dir/scripts/ort_quantize.py"
 date_string=$(date +%Y%m%d%H%M%S)
+suffix="${date_string}_lambda_${lambda}"
 
 sanitize_op_type() {
   # Match ort_quantize._sanitize_op_type_label: replace / and : with _.
@@ -122,12 +129,9 @@ for onnx_file in "$input_dir"/*.onnx; do
       echo "Quantize $onnx_file with Vishap on ${op_type}"
       echo "*********************************************************************************"
       out_file="$out_dir/${filename}_${label}.onnx"
-      echo python $quantize_script "$onnx_file" --output-model "$out_file" \
+      echo_cmd python $quantize_script "$onnx_file" --output-model "$out_file" \
         --method mixed --vishap-op-type "$op_type" --input-file "${input_image}" \
-        --seed "${seed}" --perf-out "op_type_perf_info_${date_string}.csv"
-      python $quantize_script "$onnx_file" --output-model "$out_file" \
-        --method mixed --vishap-op-type "$op_type" --input-file "${input_image}" \
-        --seed "${seed}" --perf-out "op_type_perf_info_${date_string}.csv"
+        --seed "${seed}" --lambda "${lambda}" --perf-out "op_type_perf_info_${suffix}.csv"
     done < "$types_file"
   fi
 done
@@ -150,8 +154,7 @@ for onnx_file in "$input_dir"/*.onnx; do
       [[ -z "$op_type" ]] && continue
       label="mixed_op_$(sanitize_op_type "$op_type")"
       quant_file="$out_dir/${filename}_${label}.onnx"
-      echo python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "op_type_quant_results_${date_string}.csv"
-      python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "op_type_quant_results_${date_string}.csv"
+      echo_cmd python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "op_type_quant_results_${suffix}.csv"
     done < "$types_file"
     echo
   fi

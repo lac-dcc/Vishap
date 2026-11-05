@@ -29,11 +29,6 @@ EOF
   exit "${1:-0}"
 }
 
-echo_cmd() {
-  echo "$@"
-  "$@"
-}
-
 lambda=5
 percentile=50
 seed=42
@@ -115,7 +110,6 @@ quantize_script="$root_dir/scripts/ort_quantize.py"
 # label is used for output filenames, compare --type, and section banners.
 quant_methods=(
   "vishap|--method vishap --lambda $lambda --input-file ${input_image} --seed ${seed}"
-  "vishap_agg|--method vishap --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --seed ${seed}"
   "vishap_p${percentile}|--method vishap --input-dir ${calib_dir} --num-inputs ${num_images} --seed ${seed} --range-mode percentile --range-percentile ${percentile}"
   "mixed_0.25|--method mixed --lambda $lambda --input-file ${input_image} --preload-ratio 0.25 --seed ${seed}"
   "mixed_0.50|--method mixed --lambda $lambda --input-file ${input_image} --preload-ratio 0.5 --seed ${seed}"
@@ -123,6 +117,12 @@ quant_methods=(
   "mixed_agg_0.25|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.25 --seed ${seed}"
   "mixed_agg_0.50|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.5 --seed ${seed}"
   "mixed_agg_0.75|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --preload-ratio 0.75 --seed ${seed}"
+  "mixed_agg_depth_1|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --static-depth 1 --seed ${seed}"
+  "mixed_agg_depth_3|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --static-depth 3 --seed ${seed}"
+  "mixed_agg_depth_4|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --static-depth 4 --seed ${seed}"
+  "mixed_agg_depth_6|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --static-depth 6 --seed ${seed}"
+  "mixed_agg_depth_9|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --static-depth 9 --seed ${seed}"
+  "mixed_agg_depth_19|--method mixed --lambda $lambda --input-dir ${calib_dir} --num-inputs ${num_images} --static-depth 19 --seed ${seed}"
   "calibration|--method calibration --input-dir ${calib_dir} --seed ${seed}"
   "random|--method random --seed ${seed}"
 )
@@ -140,7 +140,7 @@ for method_spec in "${quant_methods[@]}"; do
       echo "*************************$onnx_file*************************"
       filename=$(basename "${onnx_file%.*}")
       out_file="$out_dir/${filename}_${label}.onnx"
-      echo_cmd python $quantize_script "$onnx_file" --output-model "$out_file" $quant_args --perf-out "perf_info_${date_string}_lambda{$lambda}_p{$percentile}.csv"
+      echo_cmd python $quantize_script "$onnx_file" --output-model "$out_file" $quant_args --perf-out "perf_info_${date_string}_lambda${lambda}.csv" --lambda $lambda
     fi
   done
 done
@@ -158,7 +158,7 @@ for onnx_file in "$input_dir"/*.onnx; do
     for method_spec in "${quant_methods[@]}"; do
       IFS='|' read -r label _ <<< "$method_spec"
       quant_file="$out_dir/${filename}_${label}.onnx"
-      echo_cmd python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "quant_results_${date_string}_lambda{$lambda}_p{$percentile}.csv"
+      echo_cmd python $compare_script "$onnx_file" "$quant_file" --type "$label" --input "$val_dir" -o "quant_results_${date_string}_lambda${lambda}.csv"
     done
     echo
   fi

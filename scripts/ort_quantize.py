@@ -1,4 +1,5 @@
 import argparse
+import copy
 import csv
 import io
 import logging
@@ -7,15 +8,19 @@ import onnx
 import onnxruntime as ort
 import os
 import sys
+import tempfile
 import time
 
+from dataclasses import dataclass
 from enum import Enum, IntEnum
 from onnxruntime.quantization import QuantFormat, QuantType, quantize_static
 from onnxruntime.quantization.calibrate import (
     CalibrationMethod,
     CalibrationDataReader,
+    MinMaxCalibrater,
     TensorData,
     TensorsData,
+    create_calibrator,
 )
 from onnxruntime.quantization.qdq_quantizer import QDQQuantizer
 from onnxruntime.quantization.quant_utils import (
@@ -26,7 +31,11 @@ from onnxruntime.quantization.registry import QDQRegistry, QLinearOpsRegistry
 from pathlib import Path
 
 from onnx2mlir import convert_onnx_to_mlir, load_onnx_model
-from mlir_runtime import CONSTANT_OP_NAMES, mixed_candidate_op_types
+from mlir_runtime import (
+    CONSTANT_OP_NAMES,
+    mixed_candidate_op_types,
+    mixed_candidate_predecessors,
+)
 from utils import (
     Stats,
     TMP_DIR,
@@ -620,6 +629,7 @@ def _build_tensor_quant_overrides(
     calibrated_onnx_names: set[str] | None = None,
     range_mode: RangeMode = RangeMode.lambda_clip,
     percentile: float = 50,
+    locked_tensors: set[str] | None = None,
 ) -> dict[str, list[dict[str, np.float32]]]:
     """Map Vishap distribution estimates to ORT TensorQuantOverrides keys.
 
@@ -633,6 +643,9 @@ def _build_tensor_quant_overrides(
     when `onnx_name_to_axes` has a non-uniform axis for that result. The
     function's own distribution attribute is summary-only, so graph outputs
     reuse the producing node's axes.
+
+    `locked_tensors` are left unset so mixed quantization can keep the
+    calibrator range for those names.
     """
     # Map ONNX node names (from MLIR locs) to actual output tensor names.
     # TensorQuantOverrides keys must be tensor names, not node names / ":0" ports.
@@ -653,6 +666,14 @@ def _build_tensor_quant_overrides(
     injected_stats: dict[str, list[dict[str, np.float32]]] = {}
     # Final source per tensor name, so graph-output overwrites are counted once.
     used_per_axis: dict[str, bool] = {}
+    locked = locked_tensors or set()
+
+    def _store(name: str, quant: list[dict[str, np.float32]], from_axes: bool) -> None:
+        if name in locked:
+            return
+        injected_stats[name] = quant
+        used_per_axis[name] = from_axes
+
     for node_name, out_stats in onnx_name_to_dists.items():
         outputs = node_name_to_outputs.get(node_name, [])
         use_real_minmax = node_name in real_minmax_names
@@ -679,8 +700,7 @@ def _build_tensor_quant_overrides(
                 range_mode=range_mode,
                 percentile=percentile,
             )
-            injected_stats[outputs[idx]] = quant
-            used_per_axis[outputs[idx]] = from_axes
+            _store(outputs[idx], quant, from_axes)
 
     input_name = onnx_model.graph.input[0].name
     output_names = [out.name for out in onnx_model.graph.output]
@@ -691,8 +711,7 @@ def _build_tensor_quant_overrides(
         range_mode=range_mode,
         percentile=percentile,
     )
-    injected_stats[input_name] = input_quant
-    used_per_axis[input_name] = input_from_axes
+    _store(input_name, input_quant, input_from_axes)
     for output_name, stats in zip(output_names, func_output_stats):
         producer = output_to_producer.get(output_name)
         use_real_minmax = producer is not None and producer in real_minmax_names
@@ -707,8 +726,7 @@ def _build_tensor_quant_overrides(
             range_mode=range_mode,
             percentile=percentile,
         )
-        injected_stats[output_name] = quant
-        used_per_axis[output_name] = from_axes
+        _store(output_name, quant, from_axes)
 
     per_axis_count = sum(used_per_axis.values())
     logger.info(
@@ -796,14 +814,20 @@ def _load_method_inputs(
 
 
 def _collect_ort_tensor_stats(
-    onnx_model: onnx.ModelProto, batches: list[np.ndarray]
+    onnx_model: onnx.ModelProto,
+    batches: list[np.ndarray],
+    tensors_to_expose: set[str] | None = None,
+    enable_fusion: bool = False,
 ) -> dict[str, Stats]:
     """Run ORT inference(s) exposing float activations and return merged stats.
 
     We fetch raw intermediate tensors and compute full (min, max, mean,
-    variance) tuples, as required by Vishap. Graph optimizations are disabled
-    so fusions do not remove observed tensors. Multiple batches are merged as
-    if each activation were concatenated across inputs.
+    variance) tuples, as required by Vishap. By default every float activation
+    is exposed and graph optimizations are disabled, so fusions cannot remove
+    an observed tensor. ``tensors_to_expose`` limits the extra outputs to that
+    set, and ``enable_fusion`` runs at ``ORT_ENABLE_EXTENDED`` so nodes whose
+    tensors were left out can fuse. Multiple batches are merged as if each
+    activation were concatenated across inputs.
     """
     if not batches:
         return {}
@@ -823,6 +847,8 @@ def _collect_ort_tensor_stats(
 
     for node in graph.node:
         for tensor_name in node.output:
+            if tensors_to_expose is not None and tensor_name not in tensors_to_expose:
+                continue
             if tensor_name in exposed or tensor_name in initializers:
                 continue
             vi = value_infos.get(tensor_name)
@@ -836,7 +862,14 @@ def _collect_ort_tensor_stats(
                 exposed.add(tensor_name)
 
     sess_options = ort.SessionOptions()
-    sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    if enable_fusion:
+        sess_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+        )
+    else:
+        sess_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        )
     session = ort.InferenceSession(
         augmented.SerializeToString(),
         sess_options=sess_options,
@@ -844,6 +877,14 @@ def _collect_ort_tensor_stats(
     )
     input_name = session.get_inputs()[0].name
     output_names = [out.name for out in session.get_outputs()]
+    if tensors_to_expose is not None:
+        missing = sorted(tensors_to_expose - set(output_names))
+        if missing:
+            logger.warning(
+                "Stats probe missed %d tensor(s): %s",
+                len(missing),
+                ", ".join(missing),
+            )
 
     if len(batches) == 1:
         results = session.run(None, {input_name: batches[0]})
@@ -913,15 +954,12 @@ def _tensors_data_from_overrides(
     return TensorsData(CalibrationMethod.MinMax, data)
 
 
-def _quantize_from_overrides(
-    input_model: str,
+def _qdq_quantize(
+    model: onnx.ModelProto,
+    tensors_range: TensorsData,
     output_model: str,
-    injected_stats: dict[str, list[dict[str, np.float32]]],
-):
-    """QDQ-quantize using supplied rmin/rmax, without a calibration inference pass."""
-    model = load_model_with_shape_infer(Path(input_model))
-    model = update_opset_version(model, QuantType.QInt8)
-    tensors_range = _tensors_data_from_overrides(model, injected_stats)
+) -> None:
+    """QDQ-quantize with the same arguments as ``_calibration_quantization``."""
     quantizer = QDQQuantizer(
         model,
         per_channel=False,
@@ -938,6 +976,326 @@ def _quantize_from_overrides(
     quantizer.model.save_model_to_file(output_model)
 
 
+def _quantize_from_overrides(
+    input_model: str,
+    output_model: str,
+    injected_stats: dict[str, list[dict[str, np.float32]]],
+):
+    """QDQ-quantize using supplied rmin/rmax, without a calibration inference pass."""
+    model = load_model_with_shape_infer(Path(input_model))
+    model = update_opset_version(model, QuantType.QInt8)
+    tensors_range = _tensors_data_from_overrides(model, injected_stats)
+    _qdq_quantize(model, tensors_range, output_model)
+
+
+class _SelectiveMinMaxCalibrater(MinMaxCalibrater):
+    """MinMax calibration that can leave activations out and fuse the rest.
+
+    ``tensors_to_skip`` are not given ``ReduceMin``/``ReduceMax`` consumers.
+    The session runs at ``ORT_ENABLE_EXTENDED``, so a node whose outputs are
+    all in that set can fuse. Activations that are still measured keep their
+    reductions, which pins them against fusion.
+    """
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        op_types_to_calibrate: list[str],
+        augmented_model_path: str,
+        tensors_to_skip: set[str],
+    ):
+        self._tensors_to_skip = set(tensors_to_skip)
+        super().__init__(
+            model_path,
+            op_types_to_calibrate=op_types_to_calibrate,
+            augmented_model_path=augmented_model_path,
+            use_external_data_format=False,
+            symmetric=False,
+            moving_average=False,
+            averaging_constant=0.01,
+            max_intermediate_outputs=None,
+            per_channel=False,
+        )
+
+    def select_tensors_to_calibrate(self, model: onnx.ModelProto):
+        tensors, value_infos = super().select_tensors_to_calibrate(model)
+        return set(tensors) - self._tensors_to_skip, value_infos
+
+    def create_inference_session(self):
+        sess_options = ort.SessionOptions()
+        sess_options.graph_optimization_level = (
+            ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+        )
+        self.infer_session = ort.InferenceSession(
+            self.augmented_model_path,
+            sess_options=sess_options,
+            providers=self.execution_providers,
+        )
+
+
+def _prepare_calibration_model(model_path: str) -> tuple[onnx.ModelProto, bool]:
+    """Shape-infer and opset-update the model ``quantize_static`` would calibrate.
+
+    The bool is true when opset conversion replaced the model, so the
+    calibrator must read the updated copy instead of ``model_path``.
+    """
+    model = load_model_with_shape_infer(Path(model_path))
+    updated_model = update_opset_version(model, QuantType.QInt8)
+    if updated_model is not model:
+        return updated_model, True
+    return model, False
+
+
+def _collect_minmax_ranges(
+    model_path: str,
+    batches: list[np.ndarray],
+    tensors_to_skip: set[str] | None = None,
+) -> tuple[onnx.ModelProto, TensorsData]:
+    """Return the model and MinMax ranges ``quantize_static`` would use.
+
+    Follows ``quantize_static`` through ``calibrator.compute_data()``. The
+    ``TensorData`` values are the calibrator's own objects; do not rebuild
+    them from ``get_array_stats``.
+
+    ``tensors_to_skip`` drops those activations from the run and enables
+    extended graph fusions. An empty set keeps the stock calibrator, including
+    ``ORT_DISABLE_ALL``.
+    """
+    op_types = _default_op_types_to_quantize()
+    model, is_model_updated = _prepare_calibration_model(model_path)
+    skip = tensors_to_skip or set()
+
+    # The reader only needs the input name, which quantize_static takes from
+    # the original path rather than the opset-updated copy.
+    reader = RealDataCalibrationReader(model_path, batches)
+    with tempfile.TemporaryDirectory(prefix="ort.quant.") as quant_tmp_dir:
+        calibrator_input: str | onnx.ModelProto = model_path
+        if is_model_updated:
+            calibrator_input = copy.deepcopy(model)
+        if isinstance(calibrator_input, onnx.ModelProto):
+            saved_path = Path(quant_tmp_dir).joinpath("model_input.onnx").as_posix()
+            onnx.save_model(
+                calibrator_input, saved_path, save_as_external_data=True
+            )
+            calibrator_input = saved_path
+
+        augmented_model_path = (
+            Path(quant_tmp_dir).joinpath("augmented_model.onnx").as_posix()
+        )
+        if skip:
+            calibrator = _SelectiveMinMaxCalibrater(
+                Path(calibrator_input),
+                op_types,
+                augmented_model_path,
+                skip,
+            )
+            calibrator.augment_graph()
+            calibrator.create_inference_session()
+        else:
+            calibrator = create_calibrator(
+                Path(calibrator_input),
+                op_types,
+                augmented_model_path=augmented_model_path,
+                calibrate_method=CalibrationMethod.MinMax,
+                use_external_data_format=False,
+                providers=None,
+                extra_options={},
+            )
+        calibrator.collect_data(reader)
+        tensors_range = calibrator.compute_data()
+    if not isinstance(tensors_range, TensorsData):
+        raise TypeError(
+            f"Unexpected type {type(tensors_range)} for calibration ranges"
+        )
+    return model, tensors_range
+
+
+def _merge_activation_ranges(
+    calibrated: TensorsData,
+    vishap_overrides: dict[str, list[dict[str, np.float32]]],
+    keep: set[str],
+) -> TensorsData:
+    """Keep calibrator ranges for ``keep``; replace the rest from Vishap.
+
+    A finite Vishap range is written even when the calibrator did not return
+    that name, so a statically analyzed activation left out of the calibration
+    run still gets a quant range. Tensors with no finite Vishap range stay on
+    the calibrator value when one exists, and are not inserted otherwise, so a
+    hole never becomes ``[0, 0]``. A ``keep`` set that covers every calibrator
+    tensor leaves each of those ``TensorData`` objects in place.
+    """
+    merged: dict[str, TensorData] = dict(calibrated.data)
+    for name, ranges in vishap_overrides.items():
+        if name in keep or not ranges:
+            continue
+        low = np.float32(ranges[0]["rmin"])
+        high = np.float32(ranges[0]["rmax"])
+        if not np.isfinite(low) or not np.isfinite(high):
+            continue
+        merged[name] = TensorData(lowest=low, highest=high)
+    return TensorsData(calibrated.calibration_method, merged)
+
+
+@dataclass(frozen=True)
+class PreloadSelection:
+    """Which calibrator tensors keep their measured range."""
+
+    selected_outputs: set[str]
+    keep: set[str]
+    unselected_count: int
+    selected_count: int
+    pool_count: int
+
+
+def _longest_path_depths(predecessors: dict[str, list[str]]) -> dict[str, int]:
+    """Longest-path depth of each node. A node with no producers has depth 1.
+
+    ``predecessors[name]`` lists the producer names. Raises ValueError on a cycle.
+    """
+    memo: dict[str, int] = {}
+    visiting: set[str] = set()
+
+    def depth(name: str) -> int:
+        cached = memo.get(name)
+        if cached is not None:
+            return cached
+        if name in visiting:
+            raise ValueError(f"Cycle in mixed-candidate graph at {name}")
+        visiting.add(name)
+        producers = predecessors.get(name, [])
+        if not producers:
+            value = 1
+        else:
+            value = 1 + max(depth(producer) for producer in producers)
+        visiting.remove(name)
+        memo[name] = value
+        return value
+
+    for name in predecessors:
+        depth(name)
+    return {name: memo[name] for name in predecessors}
+
+
+def _names_at_static_depth(depths: dict[str, int], depth: int) -> set[str]:
+    """Names whose longest-path depth lands on the calibration stride.
+
+    Depth ``D`` calibrates nodes at depths ``D, 2D+1, 3D+2, ...``, so the first
+    calibrated node is ``D`` hops from the input and ``D`` statically analyzed
+    nodes sit between later calibrated nodes on a chain.
+    """
+    period = depth + 1
+    return {name for name, node_depth in depths.items() if node_depth % period == depth}
+
+
+def _select_preload(
+    model: onnx.ModelProto,
+    calibrated_names: set[str],
+    ratio: float | None,
+    seed: int | None,
+    vishap_op_type: str | None,
+    vishap_names: set[str] | None = None,
+    analyzable_names: set[str] | None = None,
+) -> PreloadSelection:
+    """Sample non-constant producers of calibrator tensors.
+
+    The pool is every non-constant node that produces at least one name in
+    ``calibrated_names``. ``keep`` is the outputs of the selected nodes plus
+    every calibrator tensor that is not produced by the pool (graph inputs
+    and constant outputs). At ``ratio`` 1 the unselected set is empty and
+    ``keep`` covers ``calibrated_names``.
+
+    Exactly one of ``ratio``, ``vishap_op_type``, and ``vishap_names`` is set.
+    ``vishap_names`` are pool nodes left for Vishap; every other pool node is
+    calibrated. ``analyzable_names``, when set, restricts the pool to ONNX
+    nodes Vishap can annotate. Outputs of the rest stay measured, because
+    leaving them out of calibration would leave a quant range unset.
+    """
+    provided = sum(
+        value is not None for value in (ratio, vishap_op_type, vishap_names)
+    )
+    if provided != 1:
+        raise ValueError(
+            "exactly one of ratio, vishap_op_type, or vishap_names is required"
+        )
+
+    # (node name, op type, outputs), in graph order.
+    pool: list[tuple[str, str, list[str]]] = []
+    for node in model.graph.node:
+        if node.op_type == "Constant":
+            continue
+        if analyzable_names is not None and node.name not in analyzable_names:
+            continue
+        if not any(name in calibrated_names for name in node.output):
+            continue
+        pool.append((node.name, node.op_type, list(node.output)))
+
+    if vishap_names is not None:
+        chosen = {i for i, (name, _, _) in enumerate(pool) if name not in vishap_names}
+        logger.info(
+            "Selecting %d/%d calibration ops for measured ranges "
+            "(static-depth, %d left for Vishap)",
+            len(chosen),
+            len(pool),
+            len(pool) - len(chosen),
+        )
+    elif vishap_op_type is not None:
+        chosen = {
+            i for i, (_, op_type, _) in enumerate(pool) if op_type != vishap_op_type
+        }
+        logger.info(
+            "Selecting %d/%d calibration ops for measured ranges "
+            "(vishap-op-type=%s, %d left for Vishap)",
+            len(chosen),
+            len(pool),
+            vishap_op_type,
+            len(pool) - len(chosen),
+        )
+    else:
+        assert ratio is not None
+        n = min(len(pool), max(0, int(round(ratio * len(pool)))))
+        logger.info(
+            "Selecting %d/%d calibration ops for measured ranges (ratio=%s)",
+            n,
+            len(pool),
+            ratio,
+        )
+        if n == 0:
+            chosen = set()
+        else:
+            rng = np.random.default_rng(seed)
+            chosen = {int(i) for i in rng.choice(len(pool), size=n, replace=False)}
+
+    selected_outputs: set[str] = set()
+    pool_outputs: set[str] = set()
+    unselected_count = 0
+    for index, (_, _, outputs) in enumerate(pool):
+        pool_outputs.update(outputs)
+        if index in chosen:
+            selected_outputs.update(outputs)
+        else:
+            unselected_count += 1
+
+    keep = (selected_outputs & calibrated_names) | (calibrated_names - pool_outputs)
+    return PreloadSelection(
+        selected_outputs=selected_outputs,
+        keep=keep,
+        unselected_count=unselected_count,
+        selected_count=len(chosen),
+        pool_count=len(pool),
+    )
+
+
+def _mlir_attach_names(
+    selected_outputs: set[str], node_name_to_outputs: dict[str, list[str]]
+) -> set[str]:
+    """ONNX node names on the MLIR model that produce a selected tensor."""
+    return {
+        name
+        for name, outputs in node_name_to_outputs.items()
+        if any(output in selected_outputs for output in outputs)
+    }
+
+
 def _load_onnx_and_mlir(input_model: str):
     try:
         onnx_model = load_onnx_model(input_model)
@@ -948,9 +1306,7 @@ def _load_onnx_and_mlir(input_model: str):
         return None, None
 
 
-def _quantize_with_vishap_dists(
-    input_model: str,
-    output_model: str,
+def _vishap_quant_overrides(
     onnx_model: onnx.ModelProto,
     annotated_module,
     input_stats: Stats,
@@ -958,7 +1314,9 @@ def _quantize_with_vishap_dists(
     calibrated_onnx_names: set[str] | None = None,
     range_mode: RangeMode = RangeMode.lambda_clip,
     percentile: float = 50,
-) -> list[tuple[str, float]]:
+    locked_tensors: set[str] | None = None,
+) -> tuple[dict[str, list[dict[str, np.float32]]], list[tuple[str, float]]]:
+    """Distribution overrides and the collect/build stage timings."""
     t0 = time.perf_counter_ns()
     valid_onnx_names = set(_get_onnx_node_names(onnx_model))
     (
@@ -979,15 +1337,39 @@ def _quantize_with_vishap_dists(
         calibrated_onnx_names,
         range_mode,
         percentile,
+        locked_tensors,
+    )
+    t2 = time.perf_counter_ns()
+    return injected_stats, [
+        ("collect_dists", _ns_to_ms(t0, t1)),
+        ("build_overrides", _ns_to_ms(t1, t2)),
+    ]
+
+
+def _quantize_with_vishap_dists(
+    input_model: str,
+    output_model: str,
+    onnx_model: onnx.ModelProto,
+    annotated_module,
+    input_stats: Stats,
+    lambd: int,
+    calibrated_onnx_names: set[str] | None = None,
+    range_mode: RangeMode = RangeMode.lambda_clip,
+    percentile: float = 50,
+) -> list[tuple[str, float]]:
+    injected_stats, stages = _vishap_quant_overrides(
+        onnx_model,
+        annotated_module,
+        input_stats,
+        lambd,
+        calibrated_onnx_names,
+        range_mode,
+        percentile,
     )
     t2 = time.perf_counter_ns()
     _quantize_from_overrides(input_model, output_model, injected_stats)
     t3 = time.perf_counter_ns()
-    return [
-        ("collect_dists", _ns_to_ms(t0, t1)),
-        ("build_overrides", _ns_to_ms(t1, t2)),
-        ("quantize", _ns_to_ms(t2, t3)),
-    ]
+    return [*stages, ("quantize", _ns_to_ms(t2, t3))]
 
 
 def _vishap_quantization(
@@ -1074,12 +1456,13 @@ def _mixed_quantization(
     num_inputs: int = 1,
     preload_ratio: float | None = None,
     vishap_op_type: str | None = None,
+    static_depth: int | None = None,
     seed: int | None = None,
     perf_out: str = "perf_info.csv",
     range_mode: RangeMode = RangeMode.lambda_clip,
     percentile: float = 50,
 ):
-    from mlir_runtime import attach_tensor_stats_to_ops
+    from mlir_runtime import attach_tensor_stats_to_ops, collect_mixed_float_ops
 
     t0 = time.perf_counter_ns()
     onnx_model, mlir_module = _load_onnx_and_mlir(input_model)
@@ -1101,11 +1484,6 @@ def _mixed_quantization(
 
     try:
         t2 = time.perf_counter_ns()
-        logger.info(
-            "Running ORT inference to collect activation stats from %d input(s)",
-            len(batches),
-        )
-        tensor_stats = _collect_ort_tensor_stats(onnx_model, batches)
         node_name_to_outputs, node_name_to_op_type = _onnx_node_maps(onnx_model)
         mixed_module = parse_vishap_module(_module_bytecode(mlir_module))
         if vishap_op_type is not None:
@@ -1126,37 +1504,139 @@ def _mixed_quantization(
                     vishap_op_type,
                 )
                 return
-            preloaded_names = attach_tensor_stats_to_ops(
-                mixed_module,
-                tensor_stats,
-                node_name_to_outputs,
-                node_name_to_op_type=node_name_to_op_type,
-                vishap_op_type=vishap_op_type,
+        vishap_names = None
+        if static_depth is not None:
+            candidate_depths = _longest_path_depths(
+                mixed_candidate_predecessors(mixed_module, node_name_to_outputs)
+            )
+            calibrated_names = _names_at_static_depth(
+                candidate_depths, static_depth
+            )
+            vishap_names = set(candidate_depths) - calibrated_names
+            calibrated_depths = ", ".join(
+                str(depth)
+                for depth in sorted(
+                    {candidate_depths[name] for name in calibrated_names}
+                )
+            )
+            logger.info(
+                "Static depth %d: calibrating %d/%d candidate ops at depths %s",
+                static_depth,
+                len(calibrated_names),
+                len(candidate_depths),
+                calibrated_depths or "(none)",
+            )
+            if not calibrated_names:
+                logger.warning(
+                    "No mixed candidate reaches static depth %d; "
+                    "every candidate is left for Vishap",
+                    static_depth,
+                )
+        # The pool is the producers the calibrator would measure. Choosing it
+        # before the run lets statically analyzed activations skip ReduceMin
+        # and ReduceMax, which is what allows those nodes to fuse.
+        prepared, _ = _prepare_calibration_model(input_model)
+        candidate_tensors = _float_activation_tensor_names(prepared)
+        # Ops dropped by ONNX-to-MLIR (identity Concat, Pad folded into a pool)
+        # have no Vishap distribution. They stay in the measured set.
+        analyzable_names = set(
+            collect_mixed_float_ops(mixed_module, node_name_to_outputs)
+        )
+        selection = _select_preload(
+            prepared,
+            candidate_tensors,
+            preload_ratio,
+            seed,
+            vishap_op_type,
+            vishap_names,
+            analyzable_names,
+        )
+        tensors_to_skip = candidate_tensors - selection.keep
+        logger.info(
+            "Running ORT MinMax calibration on %d input(s)",
+            len(batches),
+        )
+        if tensors_to_skip:
+            logger.info(
+                "Leaving %d activation(s) out of calibration so statically "
+                "analyzed nodes can fuse",
+                len(tensors_to_skip),
+            )
+        calib_model, calibrated = _collect_minmax_ranges(
+            input_model, batches, tensors_to_skip
+        )
+        # Mean and variance still seed the selected MLIR ops. With static
+        # nodes omitted, only the calibrated outputs are exposed and the
+        # session may fuse the rest. Quant ranges come from `calibrated`.
+        if tensors_to_skip:
+            tensor_stats = _collect_ort_tensor_stats(
+                calib_model,
+                batches,
+                tensors_to_expose=selection.selected_outputs,
+                enable_fusion=True,
             )
         else:
-            preloaded_names = attach_tensor_stats_to_ops(
-                mixed_module, tensor_stats, node_name_to_outputs, preload_ratio, seed
-            )
+            tensor_stats = _collect_ort_tensor_stats(onnx_model, batches)
+        attach_names = _mlir_attach_names(
+            selection.selected_outputs, node_name_to_outputs
+        )
+        preloaded_names = attach_tensor_stats_to_ops(
+            mixed_module, tensor_stats, node_name_to_outputs, attach_names
+        )
         t3 = time.perf_counter_ns()
-        logger.info("Preloaded ORT distributions on %d ops", len(preloaded_names))
+        logger.info(
+            "Selected %d/%d calibration ops; seeded %d MLIR ops",
+            selection.selected_count,
+            selection.pool_count,
+            len(preloaded_names),
+        )
 
         t4 = time.perf_counter_ns()
-        annotate_distributions_on_module(
-            mixed_module, [input_stats], annotate_axes=True
-        )
+        annotation_failed = False
+        try:
+            annotate_distributions_on_module(
+                mixed_module, [input_stats], annotate_axes=True
+            )
+        except Exception as exc:
+            # Nothing is left for Vishap, so the calibrator ranges are enough.
+            if selection.unselected_count:
+                raise
+            annotation_failed = True
+            logger.warning(
+                "Distribution annotation failed with every calibrator tensor "
+                "selected; quantizing from calibration ranges (%s)",
+                exc,
+            )
         t5 = time.perf_counter_ns()
 
-        quant_stages = _quantize_with_vishap_dists(
-            input_model,
-            output_model,
-            onnx_model,
-            mixed_module,
-            input_stats,
-            lambd,
-            preloaded_names,
-            range_mode,
-            percentile,
-        )
+        if annotation_failed or selection.unselected_count == 0:
+            overrides: dict[str, list[dict[str, np.float32]]] = {}
+            override_stages = [("collect_dists", 0.0), ("build_overrides", 0.0)]
+        else:
+            overrides, override_stages = _vishap_quant_overrides(
+                onnx_model,
+                mixed_module,
+                input_stats,
+                lambd,
+                preloaded_names,
+                range_mode,
+                percentile,
+                selection.keep,
+            )
+        tq = time.perf_counter_ns()
+        merged = _merge_activation_ranges(calibrated, overrides, selection.keep)
+        missing_ranges = sorted(tensors_to_skip - set(merged.data))
+        if missing_ranges:
+            logger.warning(
+                "No measured or finite Vishap range for %d activation(s): %s",
+                len(missing_ranges),
+                ", ".join(missing_ranges),
+            )
+        _qdq_quantize(calib_model, merged, output_model)
+        quant_stages = [
+            *override_stages,
+            ("quantize", _ns_to_ms(tq, time.perf_counter_ns())),
+        ]
     except ImportError:
         logger.error(
             "Unable to import Vishap Python bindings. Make sure to build Vishap with bindings enabled."
@@ -1172,7 +1652,14 @@ def _mixed_quantization(
         perf_method = (
             f"mixed_agg_op_{op_label}" if num_inputs > 1 else f"mixed_op_{op_label}"
         )
+    elif static_depth is not None:
+        perf_method = (
+            f"mixed_agg_depth_{static_depth}"
+            if num_inputs > 1
+            else f"mixed_depth_{static_depth}"
+        )
     else:
+        assert preload_ratio is not None
         perf_method = (
             f"mixed_agg_{preload_ratio:.2f}"
             if num_inputs > 1
@@ -1351,9 +1838,10 @@ def _parse_args():
         type=float,
         default=None,
         help=(
-            "fraction of non-constant float ops to preload with probe telemetry "
-            "for mixed quantization (in [0, 1]; mutually exclusive with "
-            "--vishap-op-type)"
+            "fraction of non-constant ops that produce a calibrated activation "
+            "to preload with ORT MinMax ranges for mixed quantization "
+            "(in [0, 1]; mutually exclusive with --vishap-op-type and "
+            "--static-depth)"
         ),
     )
     parser.add_argument(
@@ -1363,8 +1851,22 @@ def _parse_args():
         default=None,
         help=(
             "ONNX op type to analyze with Vishap during mixed quantization; all "
-            "other non-constant float ops are preloaded from ORT (mutually "
-            "exclusive with --preload-ratio)"
+            "other non-constant producers of calibrated activations are "
+            "preloaded from ORT MinMax (mutually exclusive with --preload-ratio "
+            "and --static-depth)"
+        ),
+    )
+    parser.add_argument(
+        "--static-depth",
+        dest="static_depth",
+        type=int,
+        default=None,
+        help=(
+            "fixed hop distance for calibrated nodes in mixed quantization. "
+            "The first calibrated node is this many candidate hops from the input, "
+            "and later calibrated nodes have this many statically analyzed "
+            "candidates between them (integer >= 1; mutually exclusive with "
+            "--preload-ratio and --vishap-op-type)"
         ),
     )
     parser.add_argument(
@@ -1443,14 +1945,22 @@ def _main() -> LogicalResult:
                 args.range_percentile,
             )
         case QuantMethod.mixed:
-            if (args.preload_ratio is None) == (args.vishap_op_type is None):
+            selectors = [
+                args.preload_ratio is not None,
+                args.vishap_op_type is not None,
+                args.static_depth is not None,
+            ]
+            if sum(selectors) != 1:
                 logger.error(
                     "Mixed quantization requires exactly one of "
-                    "--preload-ratio or --vishap-op-type"
+                    "--preload-ratio, --vishap-op-type, or --static-depth"
                 )
                 return LogicalResult.FAILURE
             if args.preload_ratio is not None and not 0.0 <= args.preload_ratio <= 1.0:
                 logger.error("--preload-ratio must be in [0, 1]")
+                return LogicalResult.FAILURE
+            if args.static_depth is not None and args.static_depth < 1:
+                logger.error("--static-depth must be >= 1")
                 return LogicalResult.FAILURE
             return _mixed_quantization(
                 args.input_model,
@@ -1461,6 +1971,7 @@ def _main() -> LogicalResult:
                 args.num_inputs,
                 args.preload_ratio,
                 args.vishap_op_type,
+                args.static_depth,
                 args.seed,
                 args.perf_out,
                 args.range_mode,
