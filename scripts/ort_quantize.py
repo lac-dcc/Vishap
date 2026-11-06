@@ -71,26 +71,30 @@ class RealDataCalibrationReader(CalibrationDataReader):
     A data reader that feeds real batches of data to the calibrator.
     """
 
-    def __init__(self, model_path: str, data_batches: list[np.ndarray]):
+    def __init__(
+        self,
+        model_path: str,
+        data_batches: list[np.ndarray | dict[str, np.ndarray]],
+    ):
         self.data_batches = data_batches
         self.iterator = iter(self.data_batches)
 
-        # We need the exact input name the model expects
+        # A bare array is wrapped with the model's first input name. Named
+        # feeds already carry every input and are returned unchanged.
         session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
         self.input_name = session.get_inputs()[0].name
 
-    def get_next(self) -> dict:
+    def get_next(self) -> dict | None:
         """
         ORT calls this method repeatedly until it returns None.
         Each dictionary returned represents one batch of calibration data.
         """
         try:
-            # Get the next batch of data from our iterator
             batch = next(self.iterator)
-            return {self.input_name: batch}
         except StopIteration:
             # Returning None tells the calibrator that we are out of data
             return None
+        return _as_session_feed(batch, self.input_name)
 
 
 class QuantMethod(Enum):
@@ -127,32 +131,71 @@ def _ort_dtype_to_numpy(ort_type: str) -> np.dtype:
     return np.float32
 
 
-def get_model_input_spec(model_path: str) -> tuple[str, list[int], bool, np.dtype]:
-    """Return (name, concrete_shape, is_nchw, dtype) for the model's first input."""
-    session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-    inp = session.get_inputs()[0]
-    raw_shape = list(inp.shape)
+def _as_session_feed(
+    batch: np.ndarray | dict[str, np.ndarray], input_name: str
+) -> dict[str, np.ndarray]:
+    """Return a named ORT feed. A bare array uses `input_name`."""
+    if isinstance(batch, dict):
+        return batch
+    return {input_name: batch}
 
+
+@dataclass(frozen=True)
+class ModelInputSpec:
+    """One concrete ONNX Runtime input."""
+
+    name: str
+    shape: list[int]
+    dtype: np.dtype
+
+
+def _concrete_input_shape(
+    raw_shape: list, model_path: str, input_name: str
+) -> list[int]:
+    """Resolve a model input shape.
+
+    A 4D image may leave the batch and spatial sizes symbolic: batch becomes
+    1 and each spatial dim becomes `DEFAULT_SPATIAL_SIZE`. Any other symbolic
+    dimension is an error.
+    """
     shape: list[int] = []
-    for i, dim in enumerate(raw_shape):
+    for index, dim in enumerate(raw_shape):
         if isinstance(dim, str) or dim is None:
-            # Batch -> 1; spatial dims -> DEFAULT_SPATIAL_SIZE
-            shape.append(1 if i == 0 else DEFAULT_SPATIAL_SIZE)
+            if len(raw_shape) != 4:
+                raise ValueError(
+                    f"Model input '{input_name}' of {model_path} has symbolic "
+                    f"shape {raw_shape}; only 4D image inputs may omit dimensions"
+                )
+            shape.append(1 if index == 0 else DEFAULT_SPATIAL_SIZE)
         else:
             shape.append(int(dim))
+    return shape
 
-    if len(shape) != 4:
-        raise ValueError(
-            f"Expected a 4D image input for {model_path}, got shape {raw_shape}"
-        )
 
-    is_nchw = is_nchw_layout(shape)
-    dtype = _ort_dtype_to_numpy(inp.type)
-    logger.info(
-        f"Model input '{inp.name}': shape={shape}, "
-        f"layout={'NCHW' if is_nchw else 'NHWC'}, dtype={dtype}"
-    )
-    return inp.name, shape, is_nchw, dtype
+def get_model_input_specs(model_path: str) -> list[ModelInputSpec]:
+    """Return one concrete spec per ONNX Runtime input, in model order."""
+    session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+    specs: list[ModelInputSpec] = []
+    for inp in session.get_inputs():
+        shape = _concrete_input_shape(list(inp.shape), model_path, inp.name)
+        dtype = _ort_dtype_to_numpy(inp.type)
+        if len(shape) == 4:
+            layout = "NCHW" if is_nchw_layout(shape) else "NHWC"
+            logger.info(
+                f"Model input '{inp.name}': shape={shape}, "
+                f"layout={layout}, dtype={dtype}"
+            )
+        else:
+            logger.info(f"Model input '{inp.name}': shape={shape}, dtype={dtype}")
+        specs.append(ModelInputSpec(inp.name, shape, dtype))
+    return specs
+
+
+def _is_single_image_input(specs: list[ModelInputSpec]) -> bool:
+    """True when the model has one 4D floating-point input."""
+    if len(specs) != 1 or len(specs[0].shape) != 4:
+        return False
+    return np.issubdtype(specs[0].dtype, np.floating)
 
 
 def _shuffle_paths(paths: list, seed: int | None) -> list:
@@ -164,15 +207,17 @@ def _shuffle_paths(paths: list, seed: int | None) -> list:
     return [paths[i] for i in order]
 
 
-def load_inputs_for_model(
+def _load_image_feeds(
+    path: Path,
+    spec: ModelInputSpec,
+    max_images: int | None,
+    seed: int | None,
     model_path: str,
-    input_path: str | Path,
-    max_images: int | None = None,
-    seed: int | None = None,
-) -> list[np.ndarray]:
-    """Load .npy tensors or images resized to the model's input shape."""
-    path = Path(input_path)
-    _, shape, is_nchw, dtype = get_model_input_spec(model_path)
+) -> list[dict[str, np.ndarray]]:
+    """Load .npy tensors or images for a single 4D input and name each one."""
+    shape = spec.shape
+    is_nchw = is_nchw_layout(shape)
+    dtype = spec.dtype
     height, width = spatial_size(shape, is_nchw)
 
     if path.is_file() and path.suffix.lower() == ".npy":
@@ -181,7 +226,7 @@ def load_inputs_for_model(
             raise ValueError(
                 f"Input {path} has shape {array.shape}, model expects {shape}"
             )
-        return [array.astype(dtype, copy=False)]
+        return [{spec.name: array.astype(dtype, copy=False)}]
 
     if path.is_dir():
         npy_files = sorted(path.glob("*.npy"))
@@ -191,7 +236,7 @@ def load_inputs_for_model(
             npy_files = _shuffle_paths(npy_files, seed)
             if max_images is not None:
                 npy_files = npy_files[:max_images]
-            return [np.load(p) for p in npy_files]
+            return [{spec.name: np.load(p)} for p in npy_files]
 
     image_paths = _shuffle_paths(collect_input_paths(path), seed)
     if max_images is not None:
@@ -199,7 +244,82 @@ def load_inputs_for_model(
 
     batches = [preprocess_image(p, height, width, is_nchw, dtype) for p in image_paths]
     logger.info(f"Loaded {len(batches)} input(s) at {height}x{width} for {model_path}")
-    return batches
+    return [{spec.name: batch} for batch in batches]
+
+
+def _collect_npz_paths(path: Path) -> list[Path]:
+    """Return one .npz path, or every .npz file under a directory."""
+    if path.is_file():
+        if path.suffix.lower() != ".npz":
+            raise ValueError(
+                f"Unsupported input file type: {path.suffix} (expected .npz)"
+            )
+        return [path]
+    if not path.is_dir():
+        raise FileNotFoundError(f"Input path does not exist: {path}")
+
+    files = sorted(p for p in path.rglob("*.npz") if p.is_file())
+    if not files:
+        raise FileNotFoundError(f"No .npz files found under {path}")
+    return files
+
+
+def _load_npz_feed(path: Path, specs: list[ModelInputSpec]) -> dict[str, np.ndarray]:
+    """Load one sample. Keys follow `specs`, and extra arrays are ignored."""
+    with np.load(path) as data:
+        feed: dict[str, np.ndarray] = {}
+        for spec in specs:
+            if spec.name not in data.files:
+                raise ValueError(f"{path} is missing input '{spec.name}'")
+            array = np.asarray(data[spec.name])
+            if tuple(array.shape) != tuple(spec.shape):
+                raise ValueError(
+                    f"Input {path} field '{spec.name}' has shape {array.shape}, "
+                    f"model expects {tuple(spec.shape)}"
+                )
+            # Copy out of the archive before it is closed.
+            feed[spec.name] = np.array(array, dtype=spec.dtype, copy=True)
+        return feed
+
+
+def _load_npz_feeds(
+    path: Path,
+    specs: list[ModelInputSpec],
+    max_images: int | None,
+    seed: int | None,
+    model_path: str,
+) -> list[dict[str, np.ndarray]]:
+    """Load .npz samples whose arrays match every model input."""
+    npz_paths = _shuffle_paths(_collect_npz_paths(path), seed)
+    if max_images is not None:
+        npz_paths = npz_paths[:max_images]
+    feeds = [_load_npz_feed(npz_path, specs) for npz_path in npz_paths]
+    logger.info(
+        "Loaded %d input(s) with %d tensor(s) each for %s",
+        len(feeds),
+        len(specs),
+        model_path,
+    )
+    return feeds
+
+
+def load_inputs_for_model(
+    model_path: str,
+    input_path: str | Path,
+    max_images: int | None = None,
+    seed: int | None = None,
+) -> list[dict[str, np.ndarray]]:
+    """Load one named feed per sample.
+
+    A model with a single 4D float input still accepts images and `.npy`
+    tensors. Every other model reads `.npz` files that contain each input
+    by name. `max_images` limits how many samples are returned.
+    """
+    path = Path(input_path)
+    specs = get_model_input_specs(model_path)
+    if _is_single_image_input(specs):
+        return _load_image_feeds(path, specs[0], max_images, seed, model_path)
+    return _load_npz_feeds(path, specs, max_images, seed, model_path)
 
 
 def export_model_input(
@@ -208,11 +328,30 @@ def export_model_input(
     output_npy: str,
     seed: int | None = None,
 ) -> None:
-    """Write one preprocessed input tensor as .npy for compare_models."""
-    batches = load_inputs_for_model(model_path, input_path, max_images=1, seed=seed)
+    """Write one preprocessed sample for later comparison.
+
+    A single-input model is saved as `.npy`. A multi-input model is saved as
+    `.npz`, and `output_npy` must already end in `.npz`.
+    """
+    feeds = load_inputs_for_model(model_path, input_path, max_images=1, seed=seed)
+    feed = feeds[0]
     os.makedirs(os.path.dirname(os.path.abspath(output_npy)) or ".", exist_ok=True)
-    np.save(output_npy, batches[0])
-    logger.info(f"Exported input tensor of shape {batches[0].shape} to {output_npy}")
+    if len(feed) == 1:
+        array = next(iter(feed.values()))
+        np.save(output_npy, array)
+        logger.info(f"Exported input tensor of shape {array.shape} to {output_npy}")
+        return
+    if Path(output_npy).suffix.lower() != ".npz":
+        raise ValueError(
+            "Multi-input models require --export-input to end with .npz, "
+            f"got {output_npy}"
+        )
+    np.savez(output_npy, **feed)
+    logger.info(
+        "Exported %d input tensor(s) to %s",
+        len(feed),
+        output_npy,
+    )
 
 
 def _onnx_node_maps(
@@ -623,7 +762,7 @@ def _build_tensor_quant_overrides(
     onnx_name_to_dists: dict[str, list[Stats]],
     onnx_name_to_axes: dict[str, list[ResultAxes]],
     func_output_stats: list[Stats],
-    input_stats: Stats,
+    input_stats: list[Stats],
     lambd: int,
     constant_onnx_names: set[str] | None = None,
     calibrated_onnx_names: set[str] | None = None,
@@ -636,8 +775,10 @@ def _build_tensor_quant_overrides(
     `calibrated_onnx_names` is the set of ONNX nodes preloaded from ORT
     calibration (mixed mode). Those nodes, and graph outputs they produce,
     use measured min/max. Passing the set (including an empty one) also marks
-    the model input as measured. `None` is the Vishap-only path, which keeps
-    the lambda clip for every non-constant.
+    each floating-point graph input as measured. Integer inputs are left out
+    of the overrides; their distributions are only for Vishap. `None` is the
+    Vishap-only path, which keeps the lambda clip for every non-constant and
+    for each floating-point graph input.
 
     Estimated ranges use the per-slice estimates on the most informative axis
     when `onnx_name_to_axes` has a non-uniform axis for that result. The
@@ -702,16 +843,36 @@ def _build_tensor_quant_overrides(
             )
             _store(outputs[idx], quant, from_axes)
 
-    input_name = onnx_model.graph.input[0].name
     output_names = [out.name for out in onnx_model.graph.output]
-    input_quant, input_from_axes = _vishap_dist_to_tensor_quant(
-        lambd,
-        input_stats,
-        use_real_minmax=calibrated_onnx_names is not None,
-        range_mode=range_mode,
-        percentile=percentile,
-    )
-    _store(input_name, input_quant, input_from_axes)
+    initializer_names = {init.name for init in onnx_model.graph.initializer}
+    graph_inputs = [
+        graph_input
+        for graph_input in onnx_model.graph.input
+        if graph_input.name not in initializer_names
+    ]
+    if len(graph_inputs) != len(input_stats):
+        raise ValueError(
+            f"Expected {len(graph_inputs)} input distribution(s), "
+            f"got {len(input_stats)}"
+        )
+    float_types = {
+        onnx.TensorProto.FLOAT,
+        onnx.TensorProto.DOUBLE,
+        onnx.TensorProto.FLOAT16,
+    }
+    for graph_input, stats in zip(graph_inputs, input_stats):
+        if not graph_input.type.HasField("tensor_type"):
+            continue
+        if graph_input.type.tensor_type.elem_type not in float_types:
+            continue
+        input_quant, input_from_axes = _vishap_dist_to_tensor_quant(
+            lambd,
+            stats,
+            use_real_minmax=calibrated_onnx_names is not None,
+            range_mode=range_mode,
+            percentile=percentile,
+        )
+        _store(graph_input.name, input_quant, input_from_axes)
     for output_name, stats in zip(output_names, func_output_stats):
         producer = output_to_producer.get(output_name)
         use_real_minmax = producer is not None and producer in real_minmax_names
@@ -768,11 +929,23 @@ def _float_activation_tensor_names(model: onnx.ModelProto) -> set[str]:
     return tensors
 
 
-def _input_stats_from_batches(batches: list[np.ndarray]) -> Stats:
-    """Stats over one batch, or concatenated batches along the batch axis."""
-    return get_array_stats(
-        batches[0] if len(batches) == 1 else np.concatenate(batches, axis=0)
-    )
+def _input_stats_from_batches(
+    batches: list[dict[str, np.ndarray]],
+) -> list[Stats]:
+    """One distribution per feed key, in key order.
+
+    Several samples are concatenated along the batch axis before the stats.
+    Image models have one key, so this is still a one-element list.
+    """
+    if not batches:
+        raise ValueError("No inputs to summarize")
+    names = list(batches[0].keys())
+    stats: list[Stats] = []
+    for name in names:
+        arrays = [batch[name] for batch in batches]
+        combined = arrays[0] if len(arrays) == 1 else np.concatenate(arrays, axis=0)
+        stats.append(get_array_stats(combined))
+    return stats
 
 
 def _load_method_inputs(
@@ -782,8 +955,8 @@ def _load_method_inputs(
     num_inputs: int,
     seed: int | None,
     method_name: str,
-) -> list[np.ndarray] | None:
-    """Load up to `num_inputs` tensors for Vishap or mixed quantization."""
+) -> list[dict[str, np.ndarray]] | None:
+    """Load up to `num_inputs` feeds for Vishap or mixed quantization."""
     if input_file:
         if num_inputs > 1:
             logger.error("--num-inputs > 1 requires --input-dir, not --input-file")
@@ -815,7 +988,7 @@ def _load_method_inputs(
 
 def _collect_ort_tensor_stats(
     onnx_model: onnx.ModelProto,
-    batches: list[np.ndarray],
+    batches: list[np.ndarray | dict[str, np.ndarray]],
     tensors_to_expose: set[str] | None = None,
     enable_fusion: bool = False,
 ) -> dict[str, Stats]:
@@ -887,7 +1060,7 @@ def _collect_ort_tensor_stats(
             )
 
     if len(batches) == 1:
-        results = session.run(None, {input_name: batches[0]})
+        results = session.run(None, _as_session_feed(batches[0], input_name))
         return {
             name: get_array_stats(np.asarray(arr).astype(np.float32))
             for name, arr in zip(output_names, results)
@@ -899,7 +1072,7 @@ def _collect_ort_tensor_stats(
     sums: dict[str, np.float64] = {}
     sumsqs: dict[str, np.float64] = {}
     for batch in batches:
-        results = session.run(None, {input_name: batch})
+        results = session.run(None, _as_session_feed(batch, input_name))
         for name, arr in zip(output_names, results):
             a = np.asarray(arr).astype(np.float32)
             mn, mx, mean, var = get_array_stats(a)
@@ -1048,7 +1221,7 @@ def _prepare_calibration_model(model_path: str) -> tuple[onnx.ModelProto, bool]:
 
 def _collect_minmax_ranges(
     model_path: str,
-    batches: list[np.ndarray],
+    batches: list[np.ndarray | dict[str, np.ndarray]],
     tensors_to_skip: set[str] | None = None,
 ) -> tuple[onnx.ModelProto, TensorsData]:
     """Return the model and MinMax ranges ``quantize_static`` would use.
@@ -1065,8 +1238,9 @@ def _collect_minmax_ranges(
     model, is_model_updated = _prepare_calibration_model(model_path)
     skip = tensors_to_skip or set()
 
-    # The reader only needs the input name, which quantize_static takes from
-    # the original path rather than the opset-updated copy.
+    # Named feeds are passed through. A bare array is wrapped with the first
+    # input name, which quantize_static also reads from the original path
+    # rather than the opset-updated copy.
     reader = RealDataCalibrationReader(model_path, batches)
     with tempfile.TemporaryDirectory(prefix="ort.quant.") as quant_tmp_dir:
         calibrator_input: str | onnx.ModelProto = model_path
@@ -1309,7 +1483,7 @@ def _load_onnx_and_mlir(input_model: str):
 def _vishap_quant_overrides(
     onnx_model: onnx.ModelProto,
     annotated_module,
-    input_stats: Stats,
+    input_stats: list[Stats],
     lambd: int,
     calibrated_onnx_names: set[str] | None = None,
     range_mode: RangeMode = RangeMode.lambda_clip,
@@ -1351,7 +1525,7 @@ def _quantize_with_vishap_dists(
     output_model: str,
     onnx_model: onnx.ModelProto,
     annotated_module,
-    input_stats: Stats,
+    input_stats: list[Stats],
     lambd: int,
     calibrated_onnx_names: set[str] | None = None,
     range_mode: RangeMode = RangeMode.lambda_clip,
@@ -1403,9 +1577,8 @@ def _vishap_quantization(
     input_stats = _input_stats_from_batches(batches)
 
     try:
-        # We assume one input tensor per model
         t2 = time.perf_counter_ns()
-        annotated_module = _annotate_module_in_memory(mlir_module, [input_stats])
+        annotated_module = _annotate_module_in_memory(mlir_module, input_stats)
         t3 = time.perf_counter_ns()
     except Exception as e:
         logger.error("Vishap quantization failed")
@@ -1595,7 +1768,7 @@ def _mixed_quantization(
         annotation_failed = False
         try:
             annotate_distributions_on_module(
-                mixed_module, [input_stats], annotate_axes=True
+                mixed_module, input_stats, annotate_axes=True
             )
         except Exception as exc:
             # Nothing is left for Vishap, so the calibrator ranges are enough.
@@ -1777,19 +1950,22 @@ def _parse_args():
         "--input-dir",
         dest="input_dir",
         type=str,
-        help="path to the directory containing input data (images or .npy)",
+        help="path to the directory containing input data (images, .npy, or .npz)",
     )
     parser.add_argument(
         "--input-file",
         dest="input_file",
         type=str,
-        help="path to a single input (.npy or image)",
+        help="path to a single input (image, .npy, or .npz)",
     )
     parser.add_argument(
         "--export-input",
         dest="export_input",
         type=str,
-        help="write one preprocessed input tensor to this .npy path and exit",
+        help=(
+            "write one preprocessed input to this path and exit "
+            "(.npy for one tensor, .npz for several)"
+        ),
     )
     parser.add_argument(
         "--lambda",
