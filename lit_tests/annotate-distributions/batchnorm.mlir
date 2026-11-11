@@ -1,4 +1,5 @@
-// RUN: vishap-opt --annotate-distributions %s | FileCheck %s
+// RUN: vishap-opt --annotate-distributions="per-axis=false" %s | FileCheck --allow-unused-prefixes %s --check-prefixes=CHECK,TENSOR
+// RUN: vishap-opt --annotate-distributions="per-axis=true annotate-axes=true" %s | FileCheck --allow-unused-prefixes %s --check-prefixes=CHECK,SLICE
 
 // Decomposed batch normalization, as produced by ONNX -> StableHLO:
 //   y = gamma * (x - running_mean) * rsqrt(running_var + eps) + beta
@@ -8,8 +9,10 @@
 // transfer function.
 //
 // Here x has range [0, 4]; running_mean = {1, 3}, running_var = {4, 1},
-// eps = 0, so rsqrt = {0.5, 1.0} and the normalized output has
+// eps = 0, so rsqrt = {0.5, 1.0}. The per-tensor normalize result has
 // min = (0 - 3) * 1 = -3, max = (4 - 1) * 0.5 = 1.5, mean 0, variance 1.
+// The per-slice result uses each channel's own range, so the summary min is
+// tighter.
 func.func @batchnorm() -> tensor<1x2x2x2xf32> {
   %x = stablehlo.constant dense<[[[[0.0, 4.0], [2.0, 2.0]], [[1.0, 3.0], [2.0, 2.0]]]]> : tensor<1x2x2x2xf32>
   %gamma = stablehlo.constant dense<[2.0, 0.5]> : tensor<2xf32>
@@ -39,25 +42,71 @@ func.func @batchnorm() -> tensor<1x2x2x2xf32> {
 // CHECK-LABEL: func.func @batchnorm
 
 // CHECK:         stablehlo.rsqrt
-// CHECK-SAME:      vishap.distribution = [
-// CHECK-SAME:        [5.000000e-01, 1.000000e+00, 0.71783702885822209, 3.600000e-02]
-// CHECK-SAME:      ]
+// Channel axis carries the two rsqrt values; the other axes are size 1.
+// SLICE-SAME:      vishap.axis_distribution = [
+// SLICE-SAME:        [
+// SLICE-SAME:          [],
+// SLICE-SAME:          {{\[\[}}5.000000e-01, 5.000000e-01, 5.000000e-01, 0.000000e+00], [1.000000e+00, 1.000000e+00, 1.000000e+00, 0.000000e+00{{\]\]}},
+// SLICE-SAME:          [],
+// SLICE-SAME:          []
+// SLICE-SAME:        ]
+// SLICE-SAME:      ]
+// SLICE-SAME:      vishap.distribution = [
+// SLICE-SAME:        [5.000000e-01, 1.000000e+00, 7.500000e-01, 6.250000e-02]
+// SLICE-SAME:      ]
+// TENSOR-SAME:     vishap.distribution = [
+// TENSOR-SAME:       [5.000000e-01, 1.000000e+00, 0.71783702885822209, 3.600000e-02]
+// TENSOR-SAME:     ]
 
 // Normalize multiply: running statistics propagated (mean 0, variance 1).
 // CHECK:         stablehlo.multiply
-// CHECK-SAME:      vishap.distribution = [
-// CHECK-SAME:        [-3.000000e+00, 1.500000e+00, 0.000000e+00, 1.000000e+00]
-// CHECK-SAME:      ]
+// SLICE-SAME:      vishap.axis_distribution = [
+// SLICE-SAME:        [
+// SLICE-SAME:          [],
+// SLICE-SAME:          {{\[\[}}-5.000000e-01, 1.500000e+00, 0.000000e+00, 1.000000e+00], [-2.000000e+00, 0.000000e+00, 0.000000e+00, 1.000000e+00{{\]\]}},
+// SLICE-SAME:          [],
+// SLICE-SAME:          []
+// SLICE-SAME:        ]
+// SLICE-SAME:      ]
+// SLICE-SAME:      vishap.distribution = [
+// SLICE-SAME:        [-2.000000e+00, 1.500000e+00, 0.000000e+00, 1.000000e+00]
+// SLICE-SAME:      ]
+// Per-tensor min/max use the whole-tensor range of x against every channel.
+// TENSOR-SAME:     vishap.distribution = [
+// TENSOR-SAME:       [-3.000000e+00, 1.500000e+00, 0.000000e+00, 1.000000e+00]
+// TENSOR-SAME:     ]
 
 // Gamma scaling flows through the abstract product transfer:
 // variance = 1 * Var(gamma) + 1 * Mean(gamma)^2 = 0.5625 + 1.5625 = 2.125.
 // CHECK:         stablehlo.multiply
-// CHECK-SAME:      vishap.distribution = [
-// CHECK-SAME:        [-6.000000e+00, 3.000000e+00, 0.000000e+00, 2.125000e+00]
-// CHECK-SAME:      ]
+// SLICE-SAME:      vishap.axis_distribution = [
+// SLICE-SAME:        [
+// SLICE-SAME:          [],
+// SLICE-SAME:          {{\[\[}}-1.000000e+00, 3.000000e+00, 0.000000e+00, 4.000000e+00], [-1.000000e+00, 0.000000e+00, 0.000000e+00, 2.500000e-01{{\]\]}},
+// SLICE-SAME:          [],
+// SLICE-SAME:          []
+// SLICE-SAME:        ]
+// SLICE-SAME:      ]
+// SLICE-SAME:      vishap.distribution = [
+// SLICE-SAME:        [-1.000000e+00, 3.000000e+00, 0.000000e+00, 2.125000e+00]
+// SLICE-SAME:      ]
+// TENSOR-SAME:     vishap.distribution = [
+// TENSOR-SAME:       [-6.000000e+00, 3.000000e+00, 0.000000e+00, 2.125000e+00]
+// TENSOR-SAME:     ]
 
 // Beta shift: mean = Mean(beta) = 0, variance = 2.125 + Var(beta) = 2.375.
 // CHECK:         stablehlo.add
-// CHECK-SAME:      vishap.distribution = [
-// CHECK-SAME:        [-6.500000e+00, 3.500000e+00, 0.000000e+00, 2.375000e+00]
-// CHECK-SAME:      ]
+// SLICE-SAME:      vishap.axis_distribution = [
+// SLICE-SAME:        [
+// SLICE-SAME:          [],
+// SLICE-SAME:          {{\[\[}}-5.000000e-01, 3.500000e+00, 5.000000e-01, 4.000000e+00], [-1.500000e+00, -5.000000e-01, -5.000000e-01, 2.500000e-01{{\]\]}},
+// SLICE-SAME:          [],
+// SLICE-SAME:          []
+// SLICE-SAME:        ]
+// SLICE-SAME:      ]
+// SLICE-SAME:      vishap.distribution = [
+// SLICE-SAME:        [-1.500000e+00, 3.500000e+00, 0.000000e+00, 2.375000e+00]
+// SLICE-SAME:      ]
+// TENSOR-SAME:     vishap.distribution = [
+// TENSOR-SAME:       [-6.500000e+00, 3.500000e+00, 0.000000e+00, 2.375000e+00]
+// TENSOR-SAME:     ]

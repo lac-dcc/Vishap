@@ -22,7 +22,6 @@ private:
     constexpr char inputSep[] = ";";
     constexpr char sep = ',';
 
-    auto ctx = builder.getContext();
     llvm::SmallVector<Attribute> funcAttrs;
     for (llvm::StringRef inputDist : llvm::split(inputDists, inputSep)) {
       auto trimedInputDist = inputDist.trim();
@@ -47,7 +46,7 @@ private:
                << inputAttrs.size() << "(" << trimedInputDist << ")";
       }
 
-      funcAttrs.push_back(ArrayAttr::get(ctx, inputAttrs));
+      funcAttrs.push_back(builder.getArrayAttr(inputAttrs));
     }
 
     if (func.getNumArguments() != funcAttrs.size()) {
@@ -56,7 +55,7 @@ private:
              << " distribution(s), but got " << funcAttrs.size();
     }
 
-    func->setAttr(kArgsDistributionAttrName, ArrayAttr::get(ctx, funcAttrs));
+    func->setAttr(kArgsDistributionAttrName, builder.getArrayAttr(funcAttrs));
 
     return success();
   }
@@ -73,7 +72,8 @@ public:
       return signalPassFailure();
     }
 
-    DistributionAnalysis analysis;
+    DistributionAnalysis analysis(
+        DistributionAnalysis::Options{.perAxis = perAxis});
     if (failed(analysis.run(func))) {
       return signalPassFailure();
     }
@@ -81,17 +81,36 @@ public:
     // Traverse analyzed operations and annotate with distribution attribute
     for (auto *op : analysis.getAnalyzedOperations()) {
       llvm::SmallVector<Attribute, 3> distributions;
+      llvm::SmallVector<Attribute, 3> axisDistributions;
       for (auto result : op->getResults()) {
-        auto distOrFailure = analysis.getDistribution(result);
+        auto distOrFailure = analysis.getTensorDistribution(result);
         if (failed(distOrFailure)) {
           return signalPassFailure();
         }
+        const TensorDistribution &dist = *(*distOrFailure);
 
-        auto distArray = distributionToArrayAttr(builder, *(*distOrFailure));
-        distributions.push_back(ArrayAttr::get(ctx, distArray));
+        auto distArray = distributionToArrayAttr(builder, dist.summary);
+        distributions.push_back(builder.getArrayAttr(distArray));
+
+        if (annotateAxes) {
+          llvm::SmallVector<Attribute> axes;
+          for (const AxisDistribution &axis : dist.axes) {
+            llvm::SmallVector<Attribute> slices;
+            for (const Distribution &slice : axis.slices) {
+              slices.push_back(builder.getArrayAttr(
+                  distributionToArrayAttr(builder, slice)));
+            }
+            axes.push_back(builder.getArrayAttr(slices));
+          }
+          axisDistributions.push_back(builder.getArrayAttr(axes));
+        }
       }
 
-      op->setAttr(kDistributionAttrName, ArrayAttr::get(ctx, distributions));
+      op->setAttr(kDistributionAttrName, builder.getArrayAttr(distributions));
+      if (annotateAxes) {
+        op->setAttr(kAxisDistributionAttrName,
+                    builder.getArrayAttr(axisDistributions));
+      }
     }
 
     // Annotate function with distribution info for return values, if available
@@ -112,10 +131,10 @@ public:
         }
 
         auto distArray = distributionToArrayAttr(builder, *(*distOrFailure));
-        distributions.push_back(ArrayAttr::get(ctx, distArray));
+        distributions.push_back(builder.getArrayAttr(distArray));
       }
 
-      func->setAttr(kDistributionAttrName, ArrayAttr::get(ctx, distributions));
+      func->setAttr(kDistributionAttrName, builder.getArrayAttr(distributions));
     }
   }
 };

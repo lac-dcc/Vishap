@@ -1,4 +1,5 @@
-// RUN: vishap-opt --annotate-distributions %s | FileCheck %s
+// RUN: vishap-opt --annotate-distributions="per-axis=false" %s | FileCheck %s
+// RUN: vishap-opt --annotate-distributions="per-axis=true annotate-axes=true" %s | FileCheck %s --check-prefixes=CHECK,SLICE
 
 func.func @concat_2d() -> tensor<6x2xf64> {
   %0 = stablehlo.constant dense<[[1.0, 2.0], [3.0, 4.0]]> : tensor<2x2xf64>
@@ -12,6 +13,13 @@ func.func @concat_2d() -> tensor<6x2xf64> {
 // CHECK-NEXT:    stablehlo.constant
 // CHECK-NEXT:    stablehlo.constant
 // CHECK-NEXT:    stablehlo.concatenate
+// Rows are appended; columns are mixtures of the inputs.
+// SLICE-SAME:      vishap.axis_distribution = [
+// SLICE-SAME:        [
+// SLICE-SAME:          {{\[\[}}1.000000e+00, 2.000000e+00, 1.500000e+00, 2.500000e-01], [3.000000e+00, 4.000000e+00, 3.500000e+00, 2.500000e-01], [5.000000e+00, 6.000000e+00, 5.500000e+00, 2.500000e-01], [7.000000e+00, 8.000000e+00, 7.500000e+00, 2.500000e-01], [9.000000e+00, 1.000000e+01, 9.500000e+00, 2.500000e-01], [1.100000e+01, 1.200000e+01, 1.150000e+01, 2.500000e-01{{\]\]}},
+// SLICE-SAME:          {{\[\[}}1.000000e+00, 1.100000e+01, 6.000000e+00, 11.666666666666666], [2.000000e+00, 1.200000e+01, 7.000000e+00, 11.666666666666666{{\]\]}}
+// SLICE-SAME:        ]
+// SLICE-SAME:      ]
 // CHECK-SAME:      vishap.distribution = [
 // CHECK-SAME:        [1.000000e+00, 1.200000e+01, 6.500000e+00, 11.916666666666666]
 // CHECK-SAME:      ]
@@ -27,6 +35,14 @@ func.func @concat_3d() -> tensor<5x10x2xf32> {
 // CHECK-NEXT:    stablehlo.constant
 // CHECK-NEXT:    stablehlo.constant
 // CHECK-NEXT:    stablehlo.concatenate
+// Only the concatenation axis is non-uniform: two slices of 0, then eight of 1.
+// SLICE-SAME:      vishap.axis_distribution = [
+// SLICE-SAME:        [
+// SLICE-SAME:          [],
+// SLICE-SAME:          {{\[\[}}0.000000e+00, 0.000000e+00, 0.000000e+00, 0.000000e+00], [0.000000e+00, 0.000000e+00, 0.000000e+00, 0.000000e+00], [1.000000e+00, 1.000000e+00, 1.000000e+00, 0.000000e+00], [1.000000e+00, 1.000000e+00, 1.000000e+00, 0.000000e+00], [1.000000e+00, 1.000000e+00, 1.000000e+00, 0.000000e+00], [1.000000e+00, 1.000000e+00, 1.000000e+00, 0.000000e+00], [1.000000e+00, 1.000000e+00, 1.000000e+00, 0.000000e+00], [1.000000e+00, 1.000000e+00, 1.000000e+00, 0.000000e+00], [1.000000e+00, 1.000000e+00, 1.000000e+00, 0.000000e+00], [1.000000e+00, 1.000000e+00, 1.000000e+00, 0.000000e+00{{\]\]}},
+// SLICE-SAME:          []
+// SLICE-SAME:        ]
+// SLICE-SAME:      ]
 // CHECK-SAME:      vishap.distribution = [
 // CHECK-SAME:        [0.000000e+00, 1.000000e+00, 8.000000e-01, 0.16000000000000003]
 // CHECK-SAME:      ]
