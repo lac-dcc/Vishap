@@ -15,6 +15,25 @@ def AnnotateDistributionsPass
       /*default=*/"",
       "Semicolon-separated list of distributions, each of which is a "
       "comma-separated list of 4 numeric values."
+    >,
+    Option<
+      "perAxis",
+      "per-axis",
+      "bool",
+      /*default=*/"true",
+      "Track one distribution per index of every tensor axis in addition to "
+      "the per-tensor summary. When false, the analysis degenerates to the "
+      "per-tensor domain."
+    >,
+    Option<
+      "annotateAxes",
+      "annotate-axes",
+      "bool",
+      /*default=*/"false",
+      "Also attach the per-axis slice distributions as the "
+      "vishap.axis_distribution attribute (one list per result, one list per "
+      "axis, empty for axes without per-slice information). Used for "
+      "debuggging."
     >
   ];
 }
