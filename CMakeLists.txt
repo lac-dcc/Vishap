@@ -67,7 +67,7 @@ include(build_tools/cmake/TorchMLIR.cmake)
 add_subdirectory(lib)
 add_subdirectory(tools)
 add_subdirectory(include)
-add_subdirectory(lit_tests)
+add_subdirectory(tests)
 
 # ------------------------------------------------------------------------------
 # Python bindings
