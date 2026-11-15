@@ -72,11 +72,13 @@ public:
     }
 
     worklist.clear();
-    // Insert probe.report before all returns
+    // Insert probe.report before all returns, forwarding the report file path
+    // to the runtime report function.
+    auto reportArgs = builder.getArrayAttr({builder.getStringAttr(reportFile)});
     funcOp.walk([&](func::ReturnOp returnOp) { worklist.push_back(returnOp); });
     for (auto returnOp : worklist) {
       builder.setInsertionPoint(returnOp);
-      probe::ReportOp::create(builder, returnOp->getLoc());
+      probe::ReportOp::create(builder, returnOp->getLoc(), reportArgs);
     }
   }
 };
