@@ -27,6 +27,7 @@ Arguments:
 
 import argparse
 import logging
+import numpy as np
 import onnx
 import sys
 
@@ -49,9 +50,9 @@ except Exception:
     exit(1)
 
 # torch-mlir ONNX converters are version-gated. MaxPool is registered at
-# sinceVersion=12 and BatchNormalization at 15, so older models (e.g. opset 9)
-# fail with `failed to legalize operation 'torch.operator'`.
-_TORCH_MLIR_TARGET_OPSET = 15
+# sinceVersion=12, BatchNormalization at 15 and GreaterOrEqual at 16, so older
+# models fail with `failed to legalize operation 'torch.operator'`.
+_TORCH_MLIR_TARGET_OPSET = 16
 
 
 def _dump_module(module, output_filename, binary_format=False, max_constant=None):
@@ -96,8 +97,139 @@ def _upgrade_onnx_opset_for_torch_mlir(model: onnx.ModelProto) -> onnx.ModelProt
     return onnx.version_converter.convert_version(model, _TORCH_MLIR_TARGET_OPSET)
 
 
+# Ops safe to evaluate eagerly when every input is a known constant. This is
+# deliberately a small whitelist of scalar/shape arithmetic.
+_FOLDABLE_OPS = frozenset(
+    {
+        "Abs",
+        "Add",
+        "Cast",
+        "Ceil",
+        "Concat",
+        "Div",
+        "Equal",
+        "Floor",
+        "Gather",
+        "Greater",
+        "Less",
+        "Max",
+        "Min",
+        "Mod",
+        "Mul",
+        "Neg",
+        "Reshape",
+        "Round",
+        "Slice",
+        "Sqrt",
+        "Squeeze",
+        "Sub",
+        "Unsqueeze",
+    }
+)
+# Constant to control the maximum acceptable size for constant folding
+_MAX_FOLD_ELEMENTS = 1024
+
+
+def _constant_node_value(node: onnx.NodeProto) -> np.ndarray | None:
+    """Return the numpy value of an ONNX ``Constant`` node, or None."""
+
+    for attr in node.attribute:
+        if attr.name == "value":
+            return onnx.numpy_helper.to_array(attr.t)
+        if attr.name == "value_int":
+            return np.array(attr.i, dtype=np.int64)
+        if attr.name == "value_ints":
+            return np.array(list(attr.ints), dtype=np.int64)
+        if attr.name == "value_float":
+            return np.array(attr.f, dtype=np.float32)
+        if attr.name == "value_floats":
+            return np.array(list(attr.floats), dtype=np.float32)
+    return None
+
+
+def _fold_constant_subgraphs(model: onnx.ModelProto) -> int:
+    """Fold small constant-only subgraphs (e.g. computed reshape targets).
+
+    ONNX shape inference does not evaluate chains like
+    ``Ceil -> Mul -> Cast -> Div`` on constants, so the tensors they feed
+    get symbolic dims. torch-mlir then emits ``torch.runtime.assert`` ops on
+    those dims that cannot be folded, and the StableHLO conversion rejects
+    them.
+
+    Returns the number of nodes replaced by constants.
+    """
+    from onnx import numpy_helper
+
+    graph = model.graph
+    graph_inputs = {i.name for i in graph.input}
+    values: dict[str, np.ndarray] = {}
+    for init in graph.initializer:
+        if init.name in graph_inputs:
+            # May be overridden at runtime
+            continue
+
+        if int(np.prod(init.dims, dtype=np.int64)) <= _MAX_FOLD_ELEMENTS:
+            values[init.name] = numpy_helper.to_array(init)
+
+    opset = _onnx_default_opset(model)
+    opsets = {"": opset} if opset is not None else None
+    folded = 0
+    for idx, node in enumerate(graph.node):
+        # Record values for constants
+        if node.op_type == "Constant":
+            value = _constant_node_value(node)
+            if value is not None and value.size <= _MAX_FOLD_ELEMENTS:
+                values[node.output[0]] = value
+            continue
+
+        # Skip non-foldable ops
+        if (
+            node.domain not in ("", "ai.onnx")
+            or node.op_type not in _FOLDABLE_OPS
+            or len(node.output) != 1
+            or not node.input
+            or any(i == "" or i not in values for i in node.input)
+        ):
+            continue
+
+        try:
+            result = onnx.reference.ReferenceEvaluator(node, opsets=opsets).run(
+                None, {i: values[i] for i in node.input}
+            )[0]
+        except Exception:
+            continue
+
+        result = np.asarray(result)
+        if result.size > _MAX_FOLD_ELEMENTS:
+            continue
+        values[node.output[0]] = result
+        graph.node[idx].CopyFrom(
+            onnx.helper.make_node(
+                "Constant",
+                [],
+                [node.output[0]],
+                name=node.name,
+                value=numpy_helper.from_array(result),
+            )
+        )
+        folded += 1
+
+    if folded:
+        # Drop nodes (typically the now-dead constant producers) whose
+        # outputs are never consumed.
+        used = {o.name for o in graph.output}
+        kept = []
+        for node in reversed(graph.node):
+            if any(o in used for o in node.output):
+                kept.append(node)
+                used.update(i for i in node.input if i)
+        del graph.node[:]
+        graph.node.extend(reversed(kept))
+    return folded
+
+
 def load_onnx_model(model: str) -> onnx.ModelProto:
-    """Load, name unnamed nodes, and run shape inference."""
+    """Load, name unnamed nodes, fold constants, and run shape inference."""
     raw_model = onnx.load(model)
     valid_opset_model = _upgrade_onnx_opset_for_torch_mlir(raw_model)
 
@@ -106,6 +238,10 @@ def load_onnx_model(model: str) -> onnx.ModelProto:
     for i, node in enumerate(valid_opset_model.graph.node):
         if not node.name:
             node.name = f"{node.op_type}_{i}"
+
+    folded = _fold_constant_subgraphs(valid_opset_model)
+    if folded:
+        logger.info("Folded %d constant-only ONNX node(s)", folded)
 
     try:
         return onnx.shape_inference.infer_shapes(valid_opset_model)
