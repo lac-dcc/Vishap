@@ -94,6 +94,20 @@ class QuantMethod(Enum):
         return self.value
 
 
+class RangeMode(Enum):
+    """How estimated per-axis slice distributions become a quant range.
+
+    `lambda`: union of per-slice lambda clips (mean ± λ√variance).
+    `percentile`: one percentile of the raw per-slice min and max estimates.
+    """
+
+    lambda_clip = "lambda"
+    percentile = "percentile"
+
+    def __str__(self):
+        return self.value
+
+
 # Slice distributions for one result: one list per axis. An empty list means
 # that axis is uniform (every slice matches the per-tensor summary).
 ResultAxes = list[list[Stats]]
@@ -336,14 +350,53 @@ def _summary_quant_range(
     return _lambda_clip(lambd, stats)
 
 
+def _percentile_slice_range(
+    axes: ResultAxes, percentile: float
+) -> tuple[float, float] | None:
+    """Percentile of the raw per-slice min and max on the most informative axis.
+
+    The same percentile is taken of the slice mins and of the slice maxes, so
+    50 is the median of each. Slices with non-finite or inverted bounds are
+    dropped. Returns `None` when there is no usable axis or no slice survives.
+    """
+    axis = _most_informative_axis(axes)
+    if axis is None:
+        return None
+
+    mins: list[float] = []
+    maxs: list[float] = []
+    for slice_stats in axes[axis]:
+        low, high = float(slice_stats[0]), float(slice_stats[1])
+        if not np.isfinite(low) or not np.isfinite(high) or low > high:
+            continue
+        mins.append(low)
+        maxs.append(high)
+    if not mins:
+        return None
+    # Each kept slice has min <= max, so the same percentile stays ordered.
+    return (
+        float(np.percentile(mins, percentile)),
+        float(np.percentile(maxs, percentile)),
+    )
+
+
 def _range_from_axes(
-    lambd: int, stats: Stats, axes: ResultAxes | None, *, use_real_minmax: bool
+    lambd: int,
+    stats: Stats,
+    axes: ResultAxes | None,
+    *,
+    use_real_minmax: bool,
+    range_mode: RangeMode = RangeMode.lambda_clip,
+    percentile: float = 50,
 ) -> tuple[float, float, bool]:
     """Return ``(rmin, rmax, used_per_axis)``.
 
-    Measured ranges keep the summary min/max. Estimated ranges use the union
-    of per-slice lambda clips on the most informative axis, falling back to
-    the summary clip when that axis is missing or the union is unusable.
+    Measured ranges keep the summary min/max. Estimated ranges come from the
+    per-slice estimates on the most informative axis: the union of per-slice
+    lambda clips (`lambda` mode) or one percentile of the raw per-slice min
+    and max (`percentile` mode; 50 is the median). Both fall back to the
+    summary lambda clip when that axis is missing or the slice range is
+    unusable.
     """
     summary_low, summary_high = _summary_quant_range(
         lambd, stats, use_real_minmax=use_real_minmax
@@ -351,6 +404,27 @@ def _range_from_axes(
     if use_real_minmax or not axes:
         return summary_low, summary_high, False
 
+    if range_mode is RangeMode.percentile:
+        slice_range = _percentile_slice_range(axes, percentile)
+        if slice_range is None:
+            return summary_low, summary_high, False
+        slice_low, slice_high = slice_range
+        # Dead slices pull a low percentile onto a near-empty range.
+        # QLinearGlobalAveragePool then rejects
+        # x_scale / (y_scale * spatial) >= 256. A slice range more than
+        # 256x narrower than the summary lambda clip is that dead-slice
+        # inlier, so keep the summary clip instead.
+        summary_width = summary_high - summary_low
+        slice_width = slice_high - slice_low
+        if (
+            not np.isfinite(summary_width)
+            or summary_width < 0
+            or slice_width < summary_width / 256.0
+        ):
+            return summary_low, summary_high, False
+        return slice_low, slice_high, True
+
+    # range_mode is RangeMode.lambda_clip
     axis = _most_informative_axis(axes)
     if axis is None:
         return summary_low, summary_high, False
@@ -379,13 +453,20 @@ def _vishap_dist_to_tensor_quant(
     *,
     use_real_minmax: bool = False,
     axes: ResultAxes | None = None,
+    range_mode: RangeMode = RangeMode.lambda_clip,
+    percentile: float = 50,
 ) -> tuple[list[dict[str, np.float32]], bool]:
-    """Map one distribution to an ORT per-tensor ``rmin``/``rmax`` override.
+    """Map one distribution to an ORT per-tensor `rmin`/`rmax` override.
 
-    The bool is true when the range came from per-axis slice clips.
+    The bool is true when the range came from per-axis slice estimates.
     """
     lowest, highest, used_per_axis = _range_from_axes(
-        lambd, stats, axes, use_real_minmax=use_real_minmax
+        lambd,
+        stats,
+        axes,
+        use_real_minmax=use_real_minmax,
+        range_mode=range_mode,
+        percentile=percentile,
     )
     bounds = _finite_float32_bounds(lowest, highest)
     if bounds is None:
@@ -538,6 +619,8 @@ def _build_tensor_quant_overrides(
     lambd: int,
     constant_onnx_names: set[str] | None = None,
     calibrated_onnx_names: set[str] | None = None,
+    range_mode: RangeMode = RangeMode.lambda_clip,
+    percentile: float = 50,
 ) -> dict[str, list[dict[str, np.float32]]]:
     """Map Vishap distribution estimates to ORT TensorQuantOverrides keys.
 
@@ -547,9 +630,10 @@ def _build_tensor_quant_overrides(
     the model input as measured. ``None`` is the Vishap-only path, which keeps
     the lambda clip for every non-constant.
 
-    Estimated ranges use per-axis slice clips when ``onnx_name_to_axes`` has a
-    non-uniform axis for that result. The function's own distribution attribute
-    is summary-only, so graph outputs reuse the producing node's axes.
+    Estimated ranges use the per-slice estimates on the most informative axis
+    when ``onnx_name_to_axes`` has a non-uniform axis for that result. The
+    function's own distribution attribute is summary-only, so graph outputs
+    reuse the producing node's axes.
     """
     # Map ONNX node names (from MLIR locs) to actual output tensor names.
     # TensorQuantOverrides keys must be tensor names, not node names / ":0" ports.
@@ -589,7 +673,12 @@ def _build_tensor_quant_overrides(
                 else None
             )
             quant, from_axes = _vishap_dist_to_tensor_quant(
-                lambd, stats, use_real_minmax=use_real_minmax, axes=axes
+                lambd,
+                stats,
+                use_real_minmax=use_real_minmax,
+                axes=axes,
+                range_mode=range_mode,
+                percentile=percentile,
             )
             injected_stats[outputs[idx]] = quant
             used_per_axis[outputs[idx]] = from_axes
@@ -597,7 +686,11 @@ def _build_tensor_quant_overrides(
     input_name = onnx_model.graph.input[0].name
     output_names = [out.name for out in onnx_model.graph.output]
     input_quant, input_from_axes = _vishap_dist_to_tensor_quant(
-        lambd, input_stats, use_real_minmax=calibrated_onnx_names is not None
+        lambd,
+        input_stats,
+        use_real_minmax=calibrated_onnx_names is not None,
+        range_mode=range_mode,
+        percentile=percentile,
     )
     injected_stats[input_name] = input_quant
     used_per_axis[input_name] = input_from_axes
@@ -608,14 +701,19 @@ def _build_tensor_quant_overrides(
             producer, output_name, node_name_to_outputs, onnx_name_to_axes
         )
         quant, from_axes = _vishap_dist_to_tensor_quant(
-            lambd, stats, use_real_minmax=use_real_minmax, axes=axes
+            lambd,
+            stats,
+            use_real_minmax=use_real_minmax,
+            axes=axes,
+            range_mode=range_mode,
+            percentile=percentile,
         )
         injected_stats[output_name] = quant
         used_per_axis[output_name] = from_axes
 
     per_axis_count = sum(used_per_axis.values())
     logger.info(
-        "Quant ranges: %d from per-axis slice clips, %d from per-tensor summary",
+        "Quant ranges: %d from per-axis slice estimates, %d from per-tensor summary",
         per_axis_count,
         len(used_per_axis) - per_axis_count,
     )
@@ -859,6 +957,8 @@ def _quantize_with_vishap_dists(
     input_stats: Stats,
     lambd: int,
     calibrated_onnx_names: set[str] | None = None,
+    range_mode: RangeMode = RangeMode.lambda_clip,
+    percentile: float = 50,
 ) -> list[tuple[str, float]]:
     t0 = time.perf_counter_ns()
     valid_onnx_names = set(_get_onnx_node_names(onnx_model))
@@ -878,6 +978,8 @@ def _quantize_with_vishap_dists(
         lambd,
         constant_onnx_names,
         calibrated_onnx_names,
+        range_mode,
+        percentile,
     )
     t2 = time.perf_counter_ns()
     _quantize_from_overrides(input_model, output_model, injected_stats)
@@ -898,6 +1000,8 @@ def _vishap_quantization(
     num_inputs: int = 1,
     seed: int | None = None,
     perf_out: str = "perf_info.csv",
+    range_mode: RangeMode = RangeMode.lambda_clip,
+    percentile: float = 50,
 ) -> LogicalResult:
     t0 = time.perf_counter_ns()
     onnx_model, mlir_module = _load_onnx_and_mlir(input_model)
@@ -928,10 +1032,19 @@ def _vishap_quantization(
         return LogicalResult.FAILURE
 
     quant_stages = _quantize_with_vishap_dists(
-        input_model, output_model, onnx_model, annotated_module, input_stats, lambd
+        input_model,
+        output_model,
+        onnx_model,
+        annotated_module,
+        input_stats,
+        lambd,
+        range_mode=range_mode,
+        percentile=percentile,
     )
 
     perf_method = "vishap_agg" if num_inputs > 1 else "vishap"
+    if range_mode is RangeMode.percentile:
+        perf_method += f"_p{percentile}"
     _save_perf_stages(
         perf_out,
         Path(input_model).stem,
@@ -964,6 +1077,8 @@ def _mixed_quantization(
     vishap_op_type: str | None = None,
     seed: int | None = None,
     perf_out: str = "perf_info.csv",
+    range_mode: RangeMode = RangeMode.lambda_clip,
+    percentile: float = 50,
 ):
     from mlir_runtime import attach_tensor_stats_to_ops
 
@@ -1040,6 +1155,8 @@ def _mixed_quantization(
             input_stats,
             lambd,
             preloaded_names,
+            range_mode,
+            percentile,
         )
     except ImportError:
         logger.error(
@@ -1062,6 +1179,8 @@ def _mixed_quantization(
             if num_inputs > 1
             else f"mixed_{preload_ratio:.2f}"
         )
+    if range_mode is RangeMode.percentile:
+        perf_method += f"_p{percentile}"
     _save_perf_stages(
         perf_out,
         Path(input_model).stem,
@@ -1194,6 +1313,30 @@ def _parse_args():
         help="lambda value for Vishap quantization (default: %(default)s)",
     )
     parser.add_argument(
+        "--range-mode",
+        dest="range_mode",
+        type=RangeMode,
+        default=RangeMode.lambda_clip,
+        choices=list(RangeMode),
+        help=(
+            "how per-axis slice estimates become a quant range: 'lambda' is "
+            "the union of per-slice lambda clips, 'percentile' is one "
+            "percentile of the raw per-slice min and max "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--range-percentile",
+        dest="range_percentile",
+        type=float,
+        default=50,
+        help=(
+            "percentile in [0, 100] of the per-slice min and of the per-slice "
+            "max when --range-mode is percentile; 50 is the median "
+            "(default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
         "--num-inputs",
         dest="num_inputs",
         type=int,
@@ -1281,6 +1424,10 @@ def _main() -> LogicalResult:
         logger.error("--num-inputs must be >= 1")
         return LogicalResult.FAILURE
 
+    if not 0 <= args.range_percentile <= 100:
+        logger.error("--range-percentile must be in [0, 100]")
+        return LogicalResult.FAILURE
+
     # TODO: use a Quantizer abstract class?
     match args.method:
         case QuantMethod.vishap:
@@ -1293,6 +1440,8 @@ def _main() -> LogicalResult:
                 args.num_inputs,
                 args.seed,
                 args.perf_out,
+                args.range_mode,
+                args.range_percentile,
             )
         case QuantMethod.mixed:
             if (args.preload_ratio is None) == (args.vishap_op_type is None):
@@ -1315,6 +1464,8 @@ def _main() -> LogicalResult:
                 args.vishap_op_type,
                 args.seed,
                 args.perf_out,
+                args.range_mode,
+                args.range_percentile,
             )
         case QuantMethod.calibration:
             if not args.input_dir:
