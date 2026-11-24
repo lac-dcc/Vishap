@@ -16,6 +16,18 @@ bool isConstantLikeOp(Operation *op) {
   return llvm::isa<stablehlo::ConstantOp, arith::ConstantOp>(op);
 }
 
+bool isPureViewOp(Operation *op) {
+  return llvm::isa<stablehlo::BroadcastInDimOp, stablehlo::ReshapeOp,
+                   stablehlo::TransposeOp>(op);
+}
+
+bool isConstantDerivedOp(Operation *op) {
+  while (op && (isPureViewOp(op) || llvm::isa<stablehlo::ConvertOp>(op))) {
+    op = op->getOperand(0).getDefiningOp();
+  }
+  return op && isConstantLikeOp(op);
+}
+
 bool hasFloatRankedTensorResult(Operation *op) {
   for (Value result : op->getResults()) {
     auto tensorType = llvm::dyn_cast<RankedTensorType>(result.getType());
@@ -32,15 +44,26 @@ public:
 
   void runOnOperation() override {
     auto funcOp = getOperation();
+    if (funcOp.getBody().empty()) {
+      return;
+    }
+
     std::vector<Operation *> worklist;
     funcOp.walk([&](Operation *op) {
       // Skip ops inside regions (reduce_window / reduce / etc.).
       if (op->getParentOp() != funcOp)
         return;
+      // If requested, add probe calls for all available float ops.
       if (allFloatOps) {
-        // If requested, add probe calls for all available float ops
-        if (!isConstantLikeOp(op) && hasFloatRankedTensorResult(op))
-          worklist.push_back(op);
+        // Never probe constants, for they are unchanged for different
+        // calibration inputs.
+        if (isConstantLikeOp(op) || !hasFloatRankedTensorResult(op))
+          return;
+        if (skipRedundantOps &&
+            (isPureViewOp(op) ||
+             (llvm::isa<stablehlo::ConvertOp>(op) && isConstantDerivedOp(op))))
+          return;
+        worklist.push_back(op);
         return;
       }
       // Default to only consider ops with vishap distribution attribute
@@ -50,6 +73,23 @@ public:
 
     auto *ctx = &getContext();
     OpBuilder builder(ctx);
+    bool addedAnyObserve = false;
+
+    if (observeFuncArgs) {
+      builder.setInsertionPointToStart(&funcOp.getBody().front());
+      // Use -1 ID for the function
+      auto funcId = builder.getI32IntegerAttr(-1);
+      for (auto [argIdx, arg] : llvm::enumerate(funcOp.getArguments())) {
+        auto tensorType = llvm::dyn_cast<RankedTensorType>(arg.getType());
+        if (!tensorType || !tensorType.getElementType().isFloat())
+          continue;
+        probe::ObserveOp::create(
+            builder, arg.getLoc(), arg, funcId,
+            builder.getI32IntegerAttr(static_cast<int32_t>(argIdx)));
+        addedAnyObserve = true;
+      }
+    }
+
     for (auto [opID, op] : llvm::enumerate(worklist)) {
       for (auto [resultID, result] : llvm::enumerate(op->getResults())) {
         auto tensorType = llvm::dyn_cast<RankedTensorType>(result.getType());
@@ -63,10 +103,11 @@ public:
         probe::ObserveOp::create(builder, loc, result,
                                  static_cast<uint32_t>(opID),
                                  static_cast<uint32_t>(resultID));
+        addedAnyObserve = true;
       }
     }
 
-    if (worklist.empty()) {
+    if (!addedAnyObserve) {
       // No need to report if no probe.observe ops were added
       return;
     }

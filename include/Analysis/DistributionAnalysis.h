@@ -17,6 +17,11 @@ constexpr char kArgsDistributionAttrName[] = "vishap.args_distribution";
 constexpr char kDistributionAttrName[] = "vishap.distribution";
 /// Attribute name for per-axis distribution info of operation results.
 constexpr char kAxisDistributionAttrName[] = "vishap.axis_distribution";
+/// Unit attribute marking function arguments whose distributions were
+/// calibrated.
+constexpr char kArgsCalibratedAttrName[] = "vishap.args_calibrated";
+/// Unit attribute marking operations whose distributions were calibrated.
+constexpr char kCalibratedAttrName[] = "vishap.calibrated";
 
 std::array<Attribute, 4>
 distributionToArrayAttr(Builder &builder, const Distribution &distribution);
@@ -28,6 +33,9 @@ public:
     /// is uniform along all axes and the analysis degenerates to the per-tensor
     /// domain.
     bool perAxis = true;
+    /// When true, only analyze constants and constant-derived operations,
+    /// skipping function arguments and dynamic operations.
+    bool constantsOnly = false;
   };
 
   DistributionAnalysis() = default;
@@ -39,6 +47,11 @@ public:
 
   const llvm::DenseSet<Operation *> &getAnalyzedOperations() const {
     return analyzedOperations;
+  }
+
+  /// Whether \p value has recorded distribution information.
+  bool hasDistribution(Value value) const {
+    return distributionMap.contains(value);
   }
 
   /// Per-tensor summary distribution of \p value.
@@ -74,7 +87,8 @@ private:
 
   /// \returns A distribution for a value of type \p type with no per-axis
   /// information.
-  TensorDistribution makeUniform(const Distribution &dist, RankedTensorType type) const;
+  TensorDistribution makeUniform(const Distribution &dist,
+                                 RankedTensorType type) const;
 
   /// Compute the empirical distribution of a constant-like operation whose
   /// value is given by \p valueAttr.

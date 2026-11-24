@@ -13,8 +13,8 @@ def AnnotateDistributionsPass
       "input-distributions",
       "std::string",
       /*default=*/"",
-      "Semicolon-separated list of distributions, each of which is a "
-      "comma-separated list of 4 numeric values."
+      "Semicolon-separated list of distributions, each of which is either a "
+      "comma-separated list of 4 numeric values or 'unit' for non-float args."
     >,
     Option<
       "perAxis",
@@ -34,6 +34,15 @@ def AnnotateDistributionsPass
       "vishap.axis_distribution attribute (one list per result, one list per "
       "axis, empty for axes without per-slice information). Used for "
       "debuggging."
+    >,
+    Option<
+      "constantsOnly",
+      "constants-only",
+      "bool",
+      /*default=*/"false",
+      "Only compute and annotate distributions for constants and "
+      "constant-derived operations, skipping function arguments and dynamic "
+      "operations."
     >
   ];
 }
@@ -60,8 +69,40 @@ def AddProbeCallsPass
       "Path of the CSV report file written by the probe runtime. Forwarded "
       "to the runtime report function via the reportArgs attribute of "
       "probe.report."
+    >,
+    Option<
+      "observeFuncArgs",
+      "observe-func-args",
+      "bool",
+      /*default=*/"false",
+      "Also insert probe.observe calls for floating-point ranked-tensor "
+      "function arguments (using opID = -1 and resultID = argument index)."
+    >,
+    Option<
+      "skipRedundantOps",
+      "skip-redundant-ops",
+      "bool",
+      /*default=*/"false",
+      "When all-float-ops is enabled, skip probing pure view operations "
+      "(broadcast_in_dim, reshape, transpose) and constant-derived convert "
+      "operations."
     >
   ];
+}
+
+def SequentializeNestedParallelLoopsPass
+    : Pass<"sequentialize-nested-parallel-loops", "mlir::func::FuncOp"> {
+  let summary = "Turn scf.parallel loops nested in other scf.parallel into scf.for";
+  let description = [{
+    Keeps the outermost `scf.parallel` of every loop nest and rewrites each
+    `scf.parallel` that is (transitively) nested inside another one into
+    sequential nested `scf.for` loops. Run it before `convert-scf-to-openmp`,
+    which would otherwise turn every nested `scf.parallel` into a nested
+    `omp.parallel` region. Those nested regions are executed by a single thread
+    but still pay a runtime fork/join for each outer iteration, and they hide
+    the inner loop from LLVM's vectorizer.
+  }];
+  let dependentDialects = ["mlir::scf::SCFDialect"];
 }
 
 #endif // VISHAP_TRANSFORMS_PASSES_TD

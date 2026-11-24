@@ -24,13 +24,18 @@ private:
 
     llvm::SmallVector<Attribute> funcAttrs;
     for (llvm::StringRef inputDist : llvm::split(inputDists, inputSep)) {
-      auto trimedInputDist = inputDist.trim();
-      if (trimedInputDist.empty()) {
+      auto trimmedInputDist = inputDist.trim();
+      if (trimmedInputDist.empty()) {
+        continue;
+      }
+
+      if (trimmedInputDist.equals_insensitive("unit")) {
+        funcAttrs.push_back(builder.getUnitAttr());
         continue;
       }
 
       llvm::SmallVector<Attribute, 4> inputAttrs;
-      for (auto valueStr : llvm::split(trimedInputDist, sep)) {
+      for (auto valueStr : llvm::split(trimmedInputDist, sep)) {
         double value;
         if (!valueStr.getAsDouble(value)) {
           inputAttrs.push_back(builder.getF64FloatAttr(value));
@@ -43,7 +48,7 @@ private:
       if (inputAttrs.size() != 4) {
         return func.emitError()
                << "Expected 4 values in distribution, but got "
-               << inputAttrs.size() << "(" << trimedInputDist << ")";
+               << inputAttrs.size() << "(" << trimmedInputDist << ")";
       }
 
       funcAttrs.push_back(builder.getArrayAttr(inputAttrs));
@@ -68,12 +73,12 @@ public:
     auto *ctx = &getContext();
     Builder builder(ctx);
 
-    if (failed(parseInputDists(func, builder))) {
+    if (!constantsOnly && failed(parseInputDists(func, builder))) {
       return signalPassFailure();
     }
 
-    DistributionAnalysis analysis(
-        DistributionAnalysis::Options{.perAxis = perAxis});
+    DistributionAnalysis analysis(DistributionAnalysis::Options{
+        .perAxis = perAxis, .constantsOnly = constantsOnly});
     if (failed(analysis.run(func))) {
       return signalPassFailure();
     }
@@ -83,6 +88,13 @@ public:
       llvm::SmallVector<Attribute, 3> distributions;
       llvm::SmallVector<Attribute, 3> axisDistributions;
       for (auto result : op->getResults()) {
+        if (!analysis.hasDistribution(result)) {
+          distributions.push_back(builder.getUnitAttr());
+          if (annotateAxes) {
+            axisDistributions.push_back(builder.getUnitAttr());
+          }
+          continue;
+        }
         auto distOrFailure = analysis.getTensorDistribution(result);
         if (failed(distOrFailure)) {
           return signalPassFailure();
@@ -116,9 +128,25 @@ public:
     // Annotate function with distribution info for return values, if available
     if (auto returnOp = llvm::dyn_cast<func::ReturnOp>(
             func.getBody().front().getTerminator())) {
+      if (constantsOnly) {
+        bool allConstantReturnsAvailable =
+            llvm::all_of(returnOp.getOperands(), [&](Value operand) {
+              auto tensorType =
+                  llvm::dyn_cast<RankedTensorType>(operand.getType());
+              if (!tensorType || !tensorType.getElementType().isFloat()) {
+                return true;
+              }
+              return analysis.hasDistribution(operand);
+            });
+        if (!allConstantReturnsAvailable) {
+          return;
+        }
+      }
+
       llvm::SmallVector<Attribute, 3> distributions;
       for (auto operand : returnOp.getOperands()) {
-        if (!llvm::isa<TensorType>(operand.getType())) {
+        auto tensorType = llvm::dyn_cast<RankedTensorType>(operand.getType());
+        if (!tensorType || !tensorType.getElementType().isFloat()) {
           distributions.push_back(builder.getUnitAttr());
           continue;
         }

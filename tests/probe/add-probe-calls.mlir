@@ -1,6 +1,7 @@
 // RUN: vishap-opt --add-probe-calls %s | FileCheck %s --check-prefixes=CHECK,DIST-ONLY
 // RUN: vishap-opt --add-probe-calls="all-float-ops" %s | FileCheck %s --check-prefixes=CHECK,ALL-OPS
 // RUN: vishap-opt --add-probe-calls="all-float-ops report-file=my_report.csv" %s | FileCheck %s --check-prefix=REPORT-FILE
+// RUN: vishap-opt --add-probe-calls="all-float-ops observe-func-args skip-redundant-ops" %s | FileCheck %s --check-prefix=CALIB
 
 // The report file path is forwarded to the runtime via the reportArgs
 // attribute of probe.report.
@@ -82,3 +83,50 @@ func.func @nested_ops(%input: tensor<1x64x112x112xf32>) -> tensor<1x64x56x56xf32
 // ALL-OPS:       probe.report
 // CHECK-NOT:     probe.report
 // CHECK:         return %[[RES]]
+
+func.func @args_and_redundant(%arg0: tensor<2x2xf32>, %idx: tensor<1xi64>, %arg2: tensor<2xf32>) -> tensor<2x2xf32> {
+  %cst_i32 = stablehlo.constant dense<[[1, 2], [3, 4]]> : tensor<2x2xi32>
+  %cst_f32 = stablehlo.convert %cst_i32 : (tensor<2x2xi32>) -> tensor<2x2xf32>
+  %bcast = stablehlo.broadcast_in_dim %arg2, dims = [1] : (tensor<2xf32>) -> tensor<2x2xf32>
+  %trans = stablehlo.transpose %arg0, dims = [1, 0] : (tensor<2x2xf32>) -> tensor<2x2xf32>
+  %sum = stablehlo.add %trans, %bcast : tensor<2x2xf32>
+  %out = stablehlo.multiply %sum, %cst_f32 : tensor<2x2xf32>
+  %reshaped = stablehlo.reshape %out : (tensor<2x2xf32>) -> tensor<4xf32>
+  %final = stablehlo.reshape %reshaped : (tensor<4xf32>) -> tensor<2x2xf32>
+  return %final : tensor<2x2xf32>
+}
+// CALIB-LABEL: func.func @args_and_redundant(
+// CALIB-SAME:    %[[ARG0:.*]]: tensor<2x2xf32>, %[[IDX:.*]]: tensor<1xi64>, %[[ARG2:.*]]: tensor<2xf32>)
+// CALIB-NEXT:    probe.observe(%[[ARG0]] : tensor<2x2xf32>) {opID = -1 : i32, resultID = 0 : i32}
+// CALIB-NEXT:    probe.observe(%[[ARG2]] : tensor<2xf32>) {opID = -1 : i32, resultID = 2 : i32}
+// CALIB-NEXT:    stablehlo.constant
+// CALIB-NEXT:    stablehlo.convert
+// CALIB-NEXT:    stablehlo.broadcast_in_dim
+// CALIB-NEXT:    stablehlo.transpose
+// CALIB-NEXT:    %[[SUM:.*]] = stablehlo.add
+// CALIB-NEXT:    probe.observe(%[[SUM]] : tensor<2x2xf32>) {opID = 0 : i32, resultID = 0 : i32}
+// CALIB-NEXT:    %[[OUT:.*]] = stablehlo.multiply
+// CALIB-NEXT:    probe.observe(%[[OUT]] : tensor<2x2xf32>) {opID = 1 : i32, resultID = 0 : i32}
+// CALIB-NEXT:    stablehlo.reshape
+// CALIB-NEXT:    stablehlo.reshape
+// CALIB-NEXT:    probe.report() {reportArgs = ["vishap_probe_report.csv"]}
+// CALIB-NEXT:    return
+// ALL-OPS-LABEL: func.func @args_and_redundant(
+// ALL-OPS-NEXT:    stablehlo.constant
+// ALL-OPS-NEXT:    %[[CVT:.*]] = stablehlo.convert
+// ALL-OPS-NEXT:    probe.observe(%[[CVT]] : tensor<2x2xf32>) {opID = 0 : i32, resultID = 0 : i32}
+// ALL-OPS-NEXT:    %[[BCAST:.*]] = stablehlo.broadcast_in_dim
+// ALL-OPS-NEXT:    probe.observe(%[[BCAST]] : tensor<2x2xf32>) {opID = 1 : i32, resultID = 0 : i32}
+// ALL-OPS-NEXT:    %[[TRANS:.*]] = stablehlo.transpose
+// ALL-OPS-NEXT:    probe.observe(%[[TRANS]] : tensor<2x2xf32>) {opID = 2 : i32, resultID = 0 : i32}
+// ALL-OPS:         probe.report() {reportArgs = ["vishap_probe_report.csv"]}
+// ALL-OPS-NEXT:    return
+
+func.func @only_arg_observed(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+  return %arg0 : tensor<4xf32>
+}
+// CALIB-LABEL: func.func @only_arg_observed(
+// CALIB-SAME:    %[[ONLY_ARG:.*]]: tensor<4xf32>)
+// CALIB-NEXT:    probe.observe(%[[ONLY_ARG]] : tensor<4xf32>) {opID = -1 : i32, resultID = 0 : i32}
+// CALIB-NEXT:    probe.report() {reportArgs = ["vishap_probe_report.csv"]}
+// CALIB-NEXT:    return

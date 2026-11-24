@@ -71,3 +71,7 @@ add_mlir_python_modules(VishapPythonModules
   COMMON_CAPI_LINK_LIBS
     VishapPythonCAPI
 )
+
+if(OpenMP_CXX_FOUND AND CMAKE_BUILD_RPATH)
+  set_property(TARGET VishapPythonCAPI APPEND PROPERTY BUILD_RPATH "${CMAKE_BUILD_RPATH}")
+endif()
