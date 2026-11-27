@@ -48,7 +48,7 @@ _mlir_ciface_probeObserveMemrefF64(UnrankedMemRefType<double> *m, int32_t opID,
   observeMemref(m, opID, resultID);
 }
 
-extern "C" PROBE_EXPORT void _mlir_ciface_probeReport(const char *reportPath) {
+extern "C" void _mlir_ciface_probeReport(const char *reportPath) {
   std::string outPath(reportPath);
   std::ofstream csvOut(outPath);
   if (!csvOut.is_open()) {

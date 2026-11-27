@@ -9,8 +9,10 @@
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/SwapByteOrder.h"
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <numeric>
 #include <optional>
@@ -81,8 +83,8 @@ FailureOr<double> getScalarConstantValue(Value value) {
       return failure();
     }
     APInt val = denseAttr.getSplatValue<APInt>();
-    return static_cast<double>(intTy.isUnsigned() ? val.getZExtValue()
-                                                  : val.getSExtValue());
+    return intTy.isUnsigned() ? static_cast<double>(val.getZExtValue())
+                              : static_cast<double>(val.getSExtValue());
   }
 
   return failure();
@@ -302,6 +304,17 @@ FailureOr<int64_t> matchSoftmax(stablehlo::DivOp divOp) {
 // Constant distributions
 //----------------------------------------------------------------------//
 
+Distribution splatScalarDistribution(double val) {
+  if (std::isfinite(val)) {
+    return pointMassDist(val);
+  }
+  constexpr double nan = std::numeric_limits<double>::quiet_NaN();
+  return {.min = std::numeric_limits<double>::infinity(),
+          .max = -std::numeric_limits<double>::infinity(),
+          .mean = nan,
+          .variance = nan};
+}
+
 /// Compute the distribution of a constant tensor of type \p type whose
 /// elements are given by \p range (iterable twice), including per-axis slice
 /// distributions when \p perAxis is set and the constant is not a splat.
@@ -325,6 +338,45 @@ computeConstantTensorDistribution(R range, RankedTensorType type, bool perAxis,
   return result;
 }
 
+/// Fast-path constant distribution computation for native float/double
+/// DenseElementsAttr: O(1) for splat constants and zero-APFloat raw pointer
+/// reduction (with SIMD + OpenMP when perAxis is false) on little-endian hosts.
+template <typename FloatT>
+TensorDistribution computeDenseFloatConstantDistribution(
+    DenseElementsAttr denseAttr, RankedTensorType tensorType, bool perAxis) {
+  static_assert(std::is_same_v<FloatT, float> || std::is_same_v<FloatT, double>,
+                "FloatT must be float or double");
+
+  if (denseAttr.isSplat() && tensorType.hasStaticShape() &&
+      tensorType.getNumElements() > 0) {
+    double val = static_cast<double>(denseAttr.getSplatValue<FloatT>());
+    return TensorDistribution::getUniform(splatScalarDistribution(val),
+                                          tensorType);
+  }
+
+  if (llvm::sys::IsLittleEndianHost && !denseAttr.isSplat() &&
+      tensorType.hasStaticShape()) {
+    size_t numElements = static_cast<size_t>(tensorType.getNumElements());
+    llvm::ArrayRef<char> rawData = denseAttr.getRawData();
+    if (rawData.size() == numElements * sizeof(FloatT) &&
+        reinterpret_cast<uintptr_t>(rawData.data()) % alignof(FloatT) == 0) {
+      const auto *ptr = reinterpret_cast<const FloatT *>(rawData.data());
+      if (!perAxis && numElements >= 256) {
+        Distribution summary =
+            computeContiguousFloatDistribution<FloatT>(ptr, numElements);
+        return TensorDistribution::getUniform(summary, tensorType);
+      }
+      llvm::ArrayRef<FloatT> rawValues(ptr, numElements);
+      return computeConstantTensorDistribution<FloatT, llvm::ArrayRef<FloatT>>(
+          rawValues, tensorType, perAxis, /*isSplat=*/false);
+    }
+  }
+
+  auto values = denseAttr.getValues<FloatT>();
+  return computeConstantTensorDistribution<FloatT, decltype(values)>(
+      values, tensorType, perAxis, denseAttr.isSplat());
+}
+
 /// Convert a constant \p denseAttr to target float type \p targetType and
 /// compute its empirical distribution. Only types with native C++ casts are
 /// supported.
@@ -338,9 +390,16 @@ FailureOr<TensorDistribution> computeConvertedConstantDistribution(
   assert(srcType != resultType.getElementType() &&
          "Source and destination types must be different for conversion.");
   bool isSplat = denseAttr.isSplat();
+  bool nonEmptySplat =
+      isSplat && resultType.hasStaticShape() && resultType.getNumElements() > 0;
 
   // f32 <-> f64
   if (srcType.isF32()) {
+    if (nonEmptySplat) {
+      double val = static_cast<FloatT>(denseAttr.getSplatValue<float>());
+      return TensorDistribution::getUniform(splatScalarDistribution(val),
+                                            resultType);
+    }
     auto mapped = llvm::map_range(denseAttr.getValues<float>(), [](float v) {
       return static_cast<FloatT>(v);
     });
@@ -348,6 +407,11 @@ FailureOr<TensorDistribution> computeConvertedConstantDistribution(
         mapped, resultType, perAxis, isSplat);
   }
   if (srcType.isF64()) {
+    if (nonEmptySplat) {
+      double val = static_cast<FloatT>(denseAttr.getSplatValue<double>());
+      return TensorDistribution::getUniform(splatScalarDistribution(val),
+                                            resultType);
+    }
     auto mapped = llvm::map_range(denseAttr.getValues<double>(), [](double v) {
       return static_cast<FloatT>(v);
     });
@@ -360,10 +424,17 @@ FailureOr<TensorDistribution> computeConvertedConstantDistribution(
     if (intTy.getWidth() <= 64) {
       // Signless/signed → signed convert (matches StableHLO: !isUnsigned)
       bool isSigned = !intTy.isUnsigned();
+      if (nonEmptySplat) {
+        APInt val = denseAttr.getSplatValue<APInt>();
+        double converted = isSigned ? static_cast<FloatT>(val.getSExtValue())
+                                    : static_cast<FloatT>(val.getZExtValue());
+        return TensorDistribution::getUniform(
+            splatScalarDistribution(converted), resultType);
+      }
       auto mapped = llvm::map_range(
           denseAttr.getValues<APInt>(), [=](const APInt &val) -> FloatT {
-            return static_cast<FloatT>(isSigned ? val.getSExtValue()
-                                                : val.getZExtValue());
+            return isSigned ? static_cast<FloatT>(val.getSExtValue())
+                            : static_cast<FloatT>(val.getZExtValue());
           });
       return computeConstantTensorDistribution<FloatT, decltype(mapped)>(
           mapped, resultType, perAxis, isSplat);
@@ -787,18 +858,14 @@ LogicalResult DistributionAnalysis::visitConstantLikeOp(Operation *op,
   if (auto denseAttr = llvm::dyn_cast<DenseElementsAttr>(valueAttr)) {
     TensorDistribution dist;
     switch (tensorType.getElementType().getIntOrFloatBitWidth()) {
-    case 32: {
-      auto values = denseAttr.getValues<float>();
-      dist = computeConstantTensorDistribution<float, decltype(values)>(
-          values, tensorType, options.perAxis, denseAttr.isSplat());
+    case 32:
+      dist = computeDenseFloatConstantDistribution<float>(denseAttr, tensorType,
+                                                          options.perAxis);
       break;
-    }
-    case 64: {
-      auto values = denseAttr.getValues<double>();
-      dist = computeConstantTensorDistribution<double, decltype(values)>(
-          values, tensorType, options.perAxis, denseAttr.isSplat());
+    case 64:
+      dist = computeDenseFloatConstantDistribution<double>(
+          denseAttr, tensorType, options.perAxis);
       break;
-    }
     default:
       return op->emitError()
              << "Unsupported element type for distribution analysis: "
@@ -1995,6 +2062,9 @@ DistributionAnalysis::visitConvert(stablehlo::ConvertOp convertOp) {
 
   Operation *constOp = getConstantDefiningOp(operand.getDefiningOp());
   if (!constOp) {
+    if (options.constantsOnly) {
+      return success();
+    }
     // FIXME: For now, we will only handle convert operations that deal with
     // constants.
     convertOp.emitError() << "Cannot handle convert op operand.";
@@ -2058,6 +2128,10 @@ LogicalResult DistributionAnalysis::visitPreloadedOperation(Operation *op) {
   }
 
   for (size_t i = 0; i < distAttr.size(); i++) {
+    if (llvm::isa<UnitAttr>(distAttr[i])) {
+      continue;
+    }
+
     auto distOrFailure = arrayAttrToDistribution(op->getLoc(), distAttr[i]);
     if (failed(distOrFailure)) {
       return failure();
@@ -2065,7 +2139,9 @@ LogicalResult DistributionAnalysis::visitPreloadedOperation(Operation *op) {
 
     auto resultType =
         llvm::dyn_cast<RankedTensorType>(op->getResult(i).getType());
-    assert(resultType && "Unexpected result type for preloaded operation.");
+    if (!resultType || !resultType.getElementType().isFloat()) {
+      continue;
+    }
     this->distributionMap[op->getResult(i)] =
         makeUniform(*distOrFailure, resultType);
   }
@@ -2076,6 +2152,41 @@ LogicalResult DistributionAnalysis::visitPreloadedOperation(Operation *op) {
 LogicalResult DistributionAnalysis::visitOperation(Operation *op) {
   if (op->hasAttr(kDistributionAttrName)) {
     return visitPreloadedOperation(op);
+  }
+
+  if (options.constantsOnly) {
+    return llvm::TypeSwitch<Operation *, LogicalResult>(op)
+        .Case<stablehlo::ConstantOp>([&](stablehlo::ConstantOp constOp) {
+          return visitConstantLikeOp(constOp, constOp.getValue());
+        })
+        .Case<arith::ConstantOp>([&](arith::ConstantOp constOp) {
+          return visitConstantLikeOp(constOp, constOp.getValue());
+        })
+        .Case<stablehlo::ConvertOp>([&](stablehlo::ConvertOp convertOp) {
+          return visitConvert(convertOp);
+        })
+        .Case<stablehlo::BroadcastInDimOp>(
+            [&](stablehlo::BroadcastInDimOp bcastOp) {
+              if (!this->distributionMap.contains(bcastOp.getOperand()))
+                return success();
+              return visitBroadcastInDim(bcastOp);
+            })
+        .Case<stablehlo::TransposeOp>([&](stablehlo::TransposeOp transposeOp) {
+          if (!this->distributionMap.contains(transposeOp.getOperand()))
+            return success();
+          return visitTranspose(transposeOp);
+        })
+        .Case<stablehlo::ReshapeOp>([&](stablehlo::ReshapeOp reshapeOp) {
+          if (!this->distributionMap.contains(reshapeOp.getOperand()))
+            return success();
+          return visitReshape(reshapeOp);
+        })
+        .Case<stablehlo::SliceOp>([&](stablehlo::SliceOp sliceOp) {
+          if (!this->distributionMap.contains(sliceOp.getOperand()))
+            return success();
+          return visitSlice(sliceOp);
+        })
+        .Default([](Operation *) { return success(); });
   }
 
   return llvm::TypeSwitch<Operation *, LogicalResult>(op)
@@ -2181,6 +2292,10 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
   }
 
   for (size_t i = 0; i < distAttr.size(); i++) {
+    if (llvm::isa<UnitAttr>(distAttr[i])) {
+      continue;
+    }
+
     auto distOrFailure = arrayAttrToDistribution(func.getLoc(), distAttr[i]);
     if (failed(distOrFailure)) {
       return failure();
@@ -2188,7 +2303,9 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
 
     auto argType =
         llvm::dyn_cast<RankedTensorType>(func.getArgument(i).getType());
-    assert(argType && "Unexpected function argument type.");
+    if (!argType || !argType.getElementType().isFloat()) {
+      continue;
+    }
     this->distributionMap[func.getArgument(i)] =
         makeUniform(*distOrFailure, argType);
   }
@@ -2197,7 +2314,7 @@ LogicalResult DistributionAnalysis::getDistributionForArgs(func::FuncOp func) {
 }
 
 LogicalResult DistributionAnalysis::run(func::FuncOp func) {
-  if (failed(getDistributionForArgs(func))) {
+  if (!options.constantsOnly && failed(getDistributionForArgs(func))) {
     return mlir::emitError(func.getLoc())
            << "Failed to get distribution info for function arguments";
   }
